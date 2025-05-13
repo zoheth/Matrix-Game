@@ -3,7 +3,7 @@ einops==0.8.1
 flash_attn==2.7.4.post1
 ftfy==6.3.1
 imageio==2.34.0
-numpy==1.6.0
+numpy==1.24.4
 opencv_python==4.9.0.80
 opencv_python_headless==4.9.0.80
 packaging==25.0
