@@ -65,6 +65,14 @@ pip install -r requirements.txt
 bash run_inference.sh
 ```
 
+
+## 🔧 Hardware Requirements
+- **GPU**:
+  - NVIDIA A100/H100
+- **VRAM**:
+  - Requires **≥80GB of GPU memory** for a single 65-frame video inference.
+
+
 ## ⭐ Acknowledgements
 
 We would like to express our gratitude to:
