@@ -95,7 +95,7 @@ If you find this project useful, please cite our paper:
 ```bibtex
 @article{zhang2025matrixgame,
   title     = {Matrix-Game: Interactive World Foundation Model},
-  author    = {Yifan Zhang and Chunli Peng and Boyang Wang and Puyi Wang and Qingcheng Zhu and Zedong Gao and Eric Li and Yang Liu and Yahui Zhou},
+  author    = {Yifan Zhang and Chunli Peng and Boyang Wang and Puyi Wang and Qingcheng Zhu and Fei Kang and Biao Jiang and Zedong Gao and Eric Li and Yang Liu and Yahui Zhou},
   journal   = {arXiv},
   year      = {2025}
 }
