@@ -48,7 +48,7 @@ def parse_args():
     parser.add_argument(
         "--mode",
         choices=['custom_input', 'GameWorld', 'GameWorld_custom'],
-        default='GameWorld_standard',
+        default='GameWorld',
         help="""This flags determine the mode of evaluations, choose one of the following:
         1. "custom_input": receive input prompt from either --prompt/--prompt_file flags or the filename
         """,

@@ -294,7 +294,7 @@ def init_submodules(dimension_list, local=False, read_frame=False):
                 subprocess.run(wget_command, check=True)
         elif dimension == 'action_control':
             submodules_dict[dimension] = {}
-        elif dimension == '3d_consistency':
+        elif dimension == 'object_consistency':
             droid_path = f'{CACHE_DIR}/droid_model/droid.pth'
             submodules_dict[dimension] = [droid_path]
         elif dimension == 'aesthetic_quality':
@@ -313,7 +313,9 @@ def init_submodules(dimension_list, local=False, read_frame=False):
                 wget_command = ['wget', 'https://github.com/chaofengc/IQA-PyTorch/releases/download/v0.1-weights/musiq_spaq_ckpt-358bb6af.pth', '-P', os.path.dirname(musiq_spaq_path)]
                 subprocess.run(wget_command, check=True)
             submodules_dict[dimension] = {'model_path': musiq_spaq_path}
-
+        elif dimension == 'scenario_consistency':
+            submodules_dict[dimension] = {}
+            
         if get_rank() == 0:
             barrier()
     return submodules_dict

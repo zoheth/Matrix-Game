@@ -8,11 +8,11 @@ With the rise of world models, an increasing number of studies have focused on t
 <a name="evaluation_results"></a>
 ## :mortar_board: Evaluation Results
 #### Overall Performance
-| Model     | Image Quality ↑ | Aesthetic Quality ↑ | Temporal Cons. ↑ | Motion Smooth. ↑ | Keyboard Acc. ↑ | Mouse Acc. ↑ | 3D Cons. ↑ |
-|-----------|------------------|-------------|-------------------|-------------------|------------------|---------------|-------------|
-| Oasis     | 0.65             | 0.48        | 0.94              | **0.98**          | 0.77             | 0.56          | 0.56        |
-| MineWorld | 0.69             | 0.47        | 0.95              | **0.98**          | 0.86             | 0.64          | 0.51        |
-| **Ours**  | **0.72**         | **0.49**    | **0.97**          | **0.98**          | **0.95**         | **0.95**      | **0.76**    |
+| Model     | Image Quality ↑ | Aesthetic Quality ↑ | Temporal Cons. ↑ | Motion Smooth. ↑ | Keyboard Acc. ↑ | Mouse Acc. ↑ | Object Cons. ↑ | Scenario Cons. ↑ 
+|-----------|------------------|-------------|-------------------|-------------------|------------------|---------------|-------------|-------------|
+| Oasis     | 0.65             | 0.48        | 0.94              | **0.98**          | 0.77             | 0.56          | 0.56        | 0.86 |
+| MineWorld | 0.69             | 0.47        | 0.95              | **0.98**          | 0.86             | 0.64          | 0.51        | 0.92 |
+| **Ours**  | **0.72**         | **0.49**    | **0.97**          | **0.98**          | **0.95**         | **0.95**      | **0.76**    |  **0.93**    |
 
 
 <a name="Installation"></a>
@@ -60,8 +60,10 @@ gdown 1PpqVt1H4maBa_GbPJp4NwxRsd9jk-elh -O ~/.cache/GameWorld_bench/droid_model/
 <a name="Usage"></a>
 ## ✅ Usage
 #### World Generation <a name="world-generation"></a>
-Before evaluation, you should have the videos prepared. The videos should have a format of {prefix}_{action_name}.mp4. If you want to evaluate per environment, then the prefix should be index. Otherwise, it could be everything (e.g. basename of init_image). In our benchmark, we test 76 actions for 32 init_images, which generates 2432 videos in a format of follows, with _the same action grouped together_:
-- data
+Before evaluation, you should have the videos prepared. The videos should have a format of {prefix}_{action_name}.mp4. If you want to evaluate per environment, then the prefix should be index. Otherwise, it could be everything (e.g. basename of init_image). 
+
+For "temporal_consistency", "aesthetic_quality", "imaging_quality", "action_control", "motion_smoothness", and "object_consistency", we test 76 actions for 32 init_images, which generates 2432 videos in a format of follows, with _the same action grouped together_:
+- data_folder1
   - 0000_attack.mp4
   - 0001_attack.mp4
   - ...
@@ -69,6 +71,16 @@ Before evaluation, you should have the videos prepared. The videos should have a
   - 0032_attack_camera_dl.mp4
   - ...
   - 2431_right_jump.mp4
+
+For "scenario_consistency", the videos to test are generated based on the same 32 init_images as above, controlled by 8 mirror actions in a format of:
+- data_folder1
+  - 0000_Mirror_0.mp4
+  - 0001_Mirror_0.mp4
+  - ...
+  - 0031_Mirror_0.mp4
+  - 0032_Mirror_1.mp4
+  - ...
+  - 0255_Mirror_7.mp4
 
 
 #### Evaluation <a name="Evaluation"></a>

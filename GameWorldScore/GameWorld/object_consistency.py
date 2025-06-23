@@ -235,7 +235,7 @@ def ThreeDimensional_consistency(video_list, droid_path):
     average_score = sum([d['video_results'] for d in video_results]) / len(video_results)
     return average_score, video_results
     
-def compute_3d_consistency(json_dir, device, submodules_list, **kwargs):
+def compute_object_consistency(json_dir, device, submodules_list, **kwargs):
     droid_path = submodules_list[0]
     video_list, _ = load_dimension_info(json_dir, dimension='action_control', lang='en')
     video_list = distribute_list_to_rank(video_list)

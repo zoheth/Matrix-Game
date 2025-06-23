@@ -16,7 +16,7 @@ class GameWorld(object):
         os.makedirs(self.output_path, exist_ok=True)    
     
     def build_GameWorld_dimension_sub_list(self, ):
-        return ["temporal_consistency", "aesthetic_quality", "imaging_quality", "action_control", "motion_smoothness", "3d_consistency"]        
+        return ["temporal_consistency", "aesthetic_quality", "imaging_quality", "action_control", "motion_smoothness", "object_consistency", "scenario_consistency"]        
 
     def check_dimension_requires_extra_info(self, dimension_list):
         dim_custom_not_supported = set(dimension_list) & set([
@@ -119,14 +119,15 @@ class GameWorld(object):
             full_info_list = load_json(self.full_info_dir)
             video_names = os.listdir(videos_path)
 
-            for action_dict in full_info_list:
-                if set(dimension_list) & set(action_dict["dimension"]):
-                    action_dict['video_list'] = []
+            for dim_dict in full_info_list:
+                # print(dimension_list, dim_dict["dimension"]) # test
+                if set(dimension_list) & set(dim_dict["dimension"]):
+                    dim_dict['video_list'] = []
                     for video_name in video_names:
-                        action_name = get_action_name_from_filepath(video_name)
-                        if action_name == action_dict['action']:
-                            action_dict['video_list'].append(os.path.join(videos_path, video_name))
-                    cur_full_info_list.append(action_dict)
+                        # action_name = get_action_name_from_filepath(video_name)
+                        dim_dict['video_list'].append(os.path.join(videos_path, video_name))
+                    cur_full_info_list.append(dim_dict)
+
         elif mode=='GameWorld_per_scene':
             full_info_list = load_json(self.full_info_dir)
             video_names = os.listdir(videos_path)
