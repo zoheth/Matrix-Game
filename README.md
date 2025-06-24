@@ -3,7 +3,7 @@
 <!-- markdownlint-disable no-duplicate-header -->
 
 # Matrix-Game: Interactive World Foundation Model
-<font size=7><div align='center' >  [[🤗 HuggingFace](https://huggingface.co/Skywork/Matrix-Game)] [[📖 Technical Report](https://arxiv.org/pdf/2506.18701)] [[🚀 Project Website](https://matrix-game-homepage.github.io/)] </div></font>
+<font size=7><div align='center' >  [[🤗 HuggingFace](https://huggingface.co/Skywork/Matrix-Game)] [[📖 Technical Report](https://github.com/SkyworkAI/Matrix-Game/blob/main/assets/report.pdf)] [[🚀 Project Website](https://matrix-game-homepage.github.io/)] </div></font>
 
 <div align="center">
   <img src="assets/videos/demo.gif" alt="teaser" />
@@ -97,7 +97,7 @@ If you find this project useful, please cite our paper:
 @article{zhang2025matrixgame,
   title     = {Matrix-Game: Interactive World Foundation Model},
   author    = {Yifan Zhang and Chunli Peng and Boyang Wang and Puyi Wang and Qingcheng Zhu and Fei Kang and Biao Jiang and Zedong Gao and Eric Li and Yang Liu and Yahui Zhou},
-  journal   = {arXiv},
+  journal   = {arXiv:2506.18701},
   year      = {2025}
 }
 ```
