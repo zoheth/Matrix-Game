@@ -4,12 +4,15 @@ from flash_attn import flash_attn_func
 import torch
 import torch.nn as nn
 from .mlp_layers import MLP, MLPEmbedder, FinalLayer
-from .attenion import attention, get_cu_seqlens
+from .attenion import attention, get_cu_seqlens, parallel_attention
 from .norm_layers import get_norm_layer
 from .posemb_layers import apply_rotary_emb, get_nd_rotary_pos_embed, get_1d_rotary_pos_embed
 
 from .activation_layers import get_activation_layer
 import torch.nn.functional as F
+
+from xfuser.core.long_ctx_attention import xFuserLongContextAttention
+import torch.distributed as dist
 
 
 def get_1d_sincos_pos_embed_from_grid(embed_dim, pos):
@@ -162,6 +165,11 @@ class ActionModule(nn.Module):
         self.windows_size = windows_size
         self.patch_size = patch_size
         # self.unpatchify_channels = unpatchify_channels # 16 VAE.config.latent_channels * patch_size ** 2
+        if dist.get_world_size() > 1:
+            self.hybrid_seq_parallel_attn = xFuserLongContextAttention()
+        else:
+            self.hybrid_seq_parallel_attn = None
+
 
     def patchify(self, x, patch_size):
         """
@@ -274,13 +282,26 @@ class ActionModule(nn.Module):
                     qq.shape == q.shape and kk.shape == k.shape
                 ), f"qq: {qq.shape}, q: {q.shape}, kk: {kk.shape}, k: {k.shape}"
                 q, k = qq, kk
-            attn = flash_attn_func(
-                q,
-                k,
-                v,
-                softmax_scale=q.shape[-1]**-0.5,
-                causal=False,
-            )
+            if not self.hybrid_seq_parallel_attn:
+                attn = flash_attn_func(
+                    q,
+                    k,
+                    v,
+                    softmax_scale=q.shape[-1]**-0.5,
+                    causal=False,
+                )
+            else:
+                attn = parallel_attention(
+                    self.hybrid_seq_parallel_attn,
+                    q,
+                    k,
+                    v,
+                    img_q_len=q.shape[1],
+                    img_kv_len=k.shape[1],
+                    cu_seqlens_q=None,
+                    cu_seqlens_kv=None
+                )
+                attn = attn.reshape(attn.shape[0], attn.shape[1], self.heads_num, -1)
             # Compute cu_squlens and max_seqlen for flash attention
             # qk norm
             attn = rearrange(attn, '(b S) T h d -> b (T S) (h d)',b=b)
@@ -317,13 +338,26 @@ class ActionModule(nn.Module):
                     qq.shape == q.shape and kk.shape == k.shape
                 ), f"img_kk: {qq.shape}, img_q: {q.shape}, img_kk: {kk.shape}, img_k: {k.shape}"
                 q, k = qq, kk
-            attn = flash_attn_func(
-                q,
-                k,
-                v,
-                softmax_scale=q.shape[-1]**-0.5,
-                causal=False,
-            )
+            if not self.hybrid_seq_parallel_attn:
+                attn = flash_attn_func(
+                    q,
+                    k,
+                    v,
+                    softmax_scale=q.shape[-1]**-0.5,
+                    causal=False,
+                )
+            else:
+                attn = parallel_attention(
+                    self.hybrid_seq_parallel_attn,
+                    q,
+                    k,
+                    v,
+                    img_q_len=q.shape[1],
+                    img_kv_len=k.shape[1],
+                    cu_seqlens_q=None,
+                    cu_seqlens_kv=None
+                )
+                attn = attn.reshape(attn.shape[0], attn.shape[1], self.heads_num, -1)
             attn = rearrange(attn, 'B L H D -> B L (H D)')
             attn = self.drop(self.proj(attn))
             hidden_states = hidden_states + attn

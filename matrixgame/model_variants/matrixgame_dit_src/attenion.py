@@ -186,45 +186,63 @@ def parallel_attention(
     cu_seqlens_q,
     cu_seqlens_kv
 ):
-    attn1 = hybrid_seq_parallel_attn(
-        None,
-        q[:, :img_q_len, :, :],
-        k[:, :img_kv_len, :, :],
-        v[:, :img_kv_len, :, :],
-        dropout_p=0.0,
-        causal=False,
-        joint_tensor_query=q[:,img_q_len:cu_seqlens_q[1]],
-        joint_tensor_key=k[:,img_kv_len:cu_seqlens_kv[1]],
-        joint_tensor_value=v[:,img_kv_len:cu_seqlens_kv[1]],
-        joint_strategy="rear",
-    )
-    if flash_attn.__version__ >= '2.7.0':
-        attn2, *_ = _flash_attn_forward(
-            q[:,cu_seqlens_q[1]:],
-            k[:,cu_seqlens_kv[1]:],
-            v[:,cu_seqlens_kv[1]:],
+    if (cu_seqlens_q is not None) and (cu_seqlens_kv is not None):
+        attn1 = hybrid_seq_parallel_attn(
+            None,
+            q[:, :img_q_len, :, :],
+            k[:, :img_kv_len, :, :],
+            v[:, :img_kv_len, :, :],
             dropout_p=0.0,
-            softmax_scale=q.shape[-1] ** (-0.5),
             causal=False,
-            window_size_left=-1,
-            window_size_right=-1,
-            softcap=0.0,
-            alibi_slopes=None,
-            return_softmax=False,
+            joint_tensor_query=q[:, img_q_len:cu_seqlens_q[1]],
+            joint_tensor_key=k[:, img_kv_len:cu_seqlens_kv[1]],
+            joint_tensor_value=v[:, img_kv_len:cu_seqlens_kv[1]],
+            joint_strategy="rear",
         )
     else:
-        attn2, *_ = _flash_attn_forward(
-            q[:,cu_seqlens_q[1]:],
-            k[:,cu_seqlens_kv[1]:],
-            v[:,cu_seqlens_kv[1]:],
+        attn1 = hybrid_seq_parallel_attn(
+            None,
+            q[:, :img_q_len, :, :],
+            k[:, :img_kv_len, :, :],
+            v[:, :img_kv_len, :, :],
             dropout_p=0.0,
-            softmax_scale=q.shape[-1] ** (-0.5),
-            causal=False,
-            window_size=(-1, -1),
-            softcap=0.0,
-            alibi_slopes=None,
-            return_softmax=False,
+            causal=False
         )
+    if (cu_seqlens_q is not None) and (cu_seqlens_kv is not None):
+        if flash_attn.__version__ >= '2.7.0':
+            attn2, *_ = _flash_attn_forward(
+                q[:, cu_seqlens_q[1]:],
+                k[:, cu_seqlens_kv[1]:],
+                v[:, cu_seqlens_kv[1]:],
+                dropout_p=0.0,
+                softmax_scale=q.shape[-1] ** (-0.5),
+                causal=False,
+                window_size_left=-1,
+                window_size_right=-1,
+                softcap=0.0,
+                alibi_slopes=None,
+                return_softmax=False,
+            )
+        else:
+            attn2, *_ = _flash_attn_forward(
+                q[:, cu_seqlens_q[1]:],
+                k[:, cu_seqlens_kv[1]:],
+                v[:, cu_seqlens_kv[1]:],
+                dropout_p=0.0,
+                softmax_scale=q.shape[-1] ** (-0.5),
+                causal=False,
+                window_size=(-1, -1),
+                softcap=0.0,
+                alibi_slopes=None,
+                return_softmax=False,
+            )
+    else:
+        attn2 = torch.randn((attn1.shape[0],
+                            0,
+                            attn1.shape[2],
+                            attn1.shape[3]),
+                            dtype=attn1.dtype,
+                            device=attn1.device)
     attn = torch.cat([attn1, attn2], dim=1)
     b, s, a, d = attn.shape
     attn = attn.reshape(b, s, -1)
