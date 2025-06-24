@@ -25,18 +25,19 @@
 ## 🚀 Performance Comparison
 ### GameWorld Score Benchmark Comparison
 
-| Model     | Image Quality ↑ | Aesthetic Quality ↑ | Temporal Cons. ↑ | Motion Smooth. ↑ | Keyboard Acc. ↑ | Mouse Acc. ↑ | 3D Cons. ↑ |
-|-----------|------------------|-------------|-------------------|-------------------|------------------|---------------|-------------|
-| Oasis     | 0.65             | 0.48        | 0.94              | **0.98**          | 0.77             | 0.56          | 0.56        |
-| MineWorld | 0.69             | 0.47        | 0.95              | **0.98**          | 0.86             | 0.64          | 0.51        |
-| **Ours**  | **0.72**         | **0.49**    | **0.97**          | **0.98**          | **0.95**         | **0.95**      | **0.76**    |
+| Model     | Image Quality ↑ | Aesthetic Quality ↑ | Temporal Cons. ↑ | Motion Smooth. ↑ | Keyboard Acc. ↑ | Mouse Acc. ↑ | Object Cons. ↑ | Scenario Cons. ↑ |
+|-----------|------------------|-------------|-------------------|-------------------|------------------|---------------|-------------|-------------|
+| Oasis     | 0.65             | 0.48        | 0.94              | **0.98**          | 0.77             | 0.56          | 0.56        |  0.86 | 
+| MineWorld | 0.69             | 0.47        | 0.95              | **0.98**          | 0.86             | 0.64          | 0.51        | 0.92        |
+| **Ours**  | **0.72**         | **0.49**    | **0.97**          | **0.98**          | **0.95**         | **0.95**      | **0.76**    | **0.93**    |
 
 **Metric Descriptions**:
 
 - **Image Quality** / **Aesthetic**: Visual fidelity and perceptual appeal of generated frames  
 - **Temporal Consistency** / **Motion Smoothness**: Temporal coherence and smoothness between frames  
 - **Keyboard Accuracy** / **Mouse Accuracy**: Accuracy in following user control signals  
-- **3D Consistency**: Geometric stability and physical plausibility over time
+- **Object Consistency**: Geometric stability and consistency of objects over time
+- **Scenario Consistency**: Scenario consistency over time
 
   Please check our [GameWorld](https://github.com/SkyworkAI/Matrix-Game/tree/main/GameWorldScore) benchmark for detailed implementation.
 
