@@ -25,7 +25,7 @@
 ## 🚀 Performance Comparison
 ### GameWorld Score Benchmark Comparison
 
-| Model     | Image Quality ↑ | Aesthetic Quality ↑ | Temporal Cons. ↑ | Motion Smooth. ↑ | Keyboard Acc. ↑ | Mouse Acc. ↑ | Object Cons. ↑ | Scenario Cons. ↑ |
+| Model     | Image Quality | Aesthetic Quality | Temporal Cons. | Motion Smooth. | Keyboard Acc. | Mouse Acc. | Object Cons. | Scenario Cons.|
 |-----------|------------------|-------------|-------------------|-------------------|------------------|---------------|-------------|-------------|
 | Oasis     | 0.65             | 0.48        | 0.94              | **0.98**          | 0.77             | 0.56          | 0.56        |  0.86 | 
 | MineWorld | 0.69             | 0.47        | 0.95              | **0.98**          | 0.86             | 0.64          | 0.51        | 0.92        |
