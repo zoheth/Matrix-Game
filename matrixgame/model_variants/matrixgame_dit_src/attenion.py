@@ -6,7 +6,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 try:
-    from flash_attn_interface import flash_attn_varlen_func
+    import flash_attn
+    from flash_attn.flash_attn_interface import _flash_attn_forward
+    from flash_attn.flash_attn_interface import flash_attn_varlen_func
 except ImportError:
     flash_attn_varlen_func = None
 

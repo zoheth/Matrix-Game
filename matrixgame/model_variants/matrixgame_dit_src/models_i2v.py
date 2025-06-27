@@ -1090,6 +1090,8 @@ class MGVideoDiffusionTransformerI2V(ModelMixin, ConfigMixin, PeftAdapterMixin):
         timestep: torch.Tensor,  # Should be in range(0, 1000).
         encoder_hidden_states: torch.Tensor = None,
         encoder_attention_mask: torch.Tensor = None,  # Now we don't use it.
+        freqs_cos: Optional[torch.Tensor] = None,
+        freqs_sin: Optional[torch.Tensor] = None,
         guidance: torch.Tensor = None,  # Guidance for modulation, should be cfg_scale x 1000.
         mouse_condition = None,
         keyboard_condition = None,
@@ -1103,7 +1105,8 @@ class MGVideoDiffusionTransformerI2V(ModelMixin, ConfigMixin, PeftAdapterMixin):
         img = x
         txt = text_states
         _, _, ot, oh, ow = x.shape
-        freqs_cos, freqs_sin = self.get_rotary_pos_embed(ot, oh, ow)
+        if (freqs_cos is None) or (freqs_sin is None):
+            freqs_cos, freqs_sin = self.get_rotary_pos_embed(ot, oh, ow)
         tt, th, tw = (
             ot // self.patch_size[0],
             oh // self.patch_size[1],
