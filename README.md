@@ -20,6 +20,7 @@
 
 ## 🔥 Latest Updates
 
+* [2025-07] 🚀 Released parallel inference script
 * [2025-05] 🎉 Initial release of Matrix-Game Model
 
 ## 🚀 Performance Comparison
