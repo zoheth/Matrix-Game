@@ -48,6 +48,7 @@ def load_text_encoder(
     # from_pretrained will ensure that the model is in eval mode.
 
     text_encoder = text_encoder.to(dtype=text_encoder_precision)
+    '''
     try:
         if torch.distributed.get_rank() == 0:
             text_encoder_dict = text_encoder.state_dict()
@@ -61,6 +62,7 @@ def load_text_encoder(
             text_encoder.load_state_dict(params[0])
     except:
         pass
+    '''
 
     text_encoder.requires_grad_(False)
     text_encoder.eval()

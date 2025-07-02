@@ -969,6 +969,8 @@ class MatrixGameVideoPipeline(DiffusionPipeline):
                 else:
                     mouse_condition_input = None
                     keyboard_condition_input = None
+                _, _, ot, oh, ow = latent_model_input.shape
+                freqs_cos, freqs_sin = self.transformer.get_rotary_pos_embed(ot, oh, ow)
                 # predict the noise residual
                 with torch.autocast(
                     device_type="cuda", dtype=target_dtype, enabled=autocast_enabled
@@ -979,6 +981,8 @@ class MatrixGameVideoPipeline(DiffusionPipeline):
                         timestep = t_expand,  # [2]
                         encoder_hidden_states=(prompt_embeds, prompt_embeds_2),  # [2, 256, 4096]
                         encoder_attention_mask=(prompt_mask, prompt_mask_2),  # [2, 256]
+                        freqs_cos = freqs_cos,
+                        freqs_sin = freqs_sin,
                         guidance=guidance_expand,
                         return_dict=True,
                         mouse_condition = mouse_condition_input,
