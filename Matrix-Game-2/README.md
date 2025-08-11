@@ -73,7 +73,6 @@ We would like to express our gratitude to:
 - [GameFactory](https://github.com/KwaiVGI/GameFactory) for their idea of action control module
 - [MineRL](https://github.com/minerllabs/minerl) for their excellent gym framework
 - [Video-Pre-Training](https://github.com/openai/Video-Pre-Training) for their accurate Inverse Dynamics Model
-- [TAEHV-VAE](https://github.com/madebyollin/taehv/) for their excellent work for accelerating VAE decoding
 
 ## 📄 License
 
