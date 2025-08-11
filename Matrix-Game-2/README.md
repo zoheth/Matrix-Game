@@ -39,7 +39,7 @@ python setup.py develop
 ## Quick Start
 ### Download checkpoints
 ```
-huggingface-cli download Matrix-Game-2.0 --local-dir Matrix-Game-2.0
+huggingface-cli download Skywork/Matrix-Game-2.0 --local-dir Matrix-Game-2.0
 ```
 
 ### Inference
