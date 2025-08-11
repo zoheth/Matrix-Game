@@ -7,7 +7,7 @@
 
 
 <div align="center">
-  <img src="assets/images/cover.png" alt="teaser" />
+  <img src="assets/videos/matrix-game2.mp4" alt="teaser" />
 </div>
 
 ## 📝 Overview
