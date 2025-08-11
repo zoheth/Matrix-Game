@@ -61,15 +61,15 @@ class InteractiveGameInference:
         current_vae_decoder.to(self.device, torch.float16)
         current_vae_decoder.requires_grad_(False)
         current_vae_decoder.eval()
-        self.current_vae_decoder = current_vae_decoder
-        # current_vae_decoder.compile(mode="max-autotune-no-cudagraphs")
-        pipeline = CausalInferencePipeline(self.config, generator=generator)
+        current_vae_decoder.compile(mode="max-autotune-no-cudagraphs")
+        pipeline = CausalInferencePipeline(self.config, generator=generator, vae_decoder=current_vae_decoder)
         if self.args.checkpoint_path:
+            print("Loading Pretrained Model...")
             state_dict = load_file(self.args.checkpoint_path)
             pipeline.generator.load_state_dict(state_dict)
-            print("Loading Pretrained Model...")
+
         self.pipeline = pipeline.to(device=self.device, dtype=self.weight_dtype)
-        
+        self.pipeline.vae_decoder.to(torch.float16)
 
         vae = get_wanx_vae_wrapper(self.args.pretrained_model_path, torch.float16)
         vae.requires_grad_(False)
@@ -135,8 +135,8 @@ class InteractiveGameInference:
                 noise=sampled_noise,
                 conditional_dict=conditional_dict,
                 return_latents=False,
-                vae=self.current_vae_decoder,
-                mode=mode
+                mode=mode,
+                profile=False
             )
 
         videos_tensor = torch.cat(videos, dim=1)

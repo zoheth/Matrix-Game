@@ -2,6 +2,7 @@ import os
 import argparse
 import torch
 import numpy as np
+import copy
 
 from omegaconf import OmegaConf
 from torchvision.transforms import v2
@@ -60,15 +61,15 @@ class InteractiveGameInference:
         current_vae_decoder.to(self.device, torch.float16)
         current_vae_decoder.requires_grad_(False)
         current_vae_decoder.eval()
-        self.current_vae_decoder = current_vae_decoder
-        # current_vae_decoder.compile(mode="max-autotune-no-cudagraphs")
-        pipeline = CausalInferenceStreamingPipeline(self.config, generator=generator)
+        current_vae_decoder.compile(mode="max-autotune-no-cudagraphs")
+        pipeline = CausalInferenceStreamingPipeline(self.config, generator=generator, vae_decoder=current_vae_decoder)
         if self.args.checkpoint_path:
+            print("Loading Pretrained Model...")
             state_dict = load_file(self.args.checkpoint_path)
             pipeline.generator.load_state_dict(state_dict)
-            print("Loading Pretrained Model...")
+
         self.pipeline = pipeline.to(device=self.device, dtype=self.weight_dtype)
-        
+        self.pipeline.vae_decoder.to(torch.float16)
 
         vae = get_wanx_vae_wrapper(self.args.pretrained_model_path, torch.float16)
         vae.requires_grad_(False)
@@ -139,8 +140,7 @@ class InteractiveGameInference:
             videos = self.pipeline.inference(
                 noise=sampled_noise,
                 conditional_dict=conditional_dict,
-                return_latents=True,
-                vae=self.current_vae_decoder,
+                return_latents=False,
                 output_folder=self.args.output_folder,
                 name=os.path.basename(img_path),
                 mode=mode

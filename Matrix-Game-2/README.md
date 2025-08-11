@@ -7,16 +7,11 @@
 
 
 <div align="center">
-  <img src="assets/videos/demo.gif" alt="teaser" />
+  <img src="assets/images/cover.png" alt="teaser" />
 </div>
 
 ## 📝 Overview
-**Matrix-Game-2.0** is an interactive world foundation model for real-time long video generation.
-
-## ✨ Key Features
-
-- 🎯 **Feature 1**: **Streaming Interactive Generation.**  An auto-regressive diffusion-based image-to-world model that generates real-time[25fps] long videos conditioned on keyboard and mouse inputs, enabling fine-grained control and dynamic scene evolution.
-- 💡 **Feature 2**: **Data Production Pipeline** We design the first open-source interactive data production pipeline built on Unreal Engine and GTA5 environments, establishing a new standard for world model research through systematic data collection and annotation process.
+**Matrix-Game-2.0** is an interactive world foundation model for real-time long video generation.  Built upon an auto-regressive diffusion-based image-to-world framework, it can generate real-time[25fps] long videos conditioned on keyboard and mouse inputs, enabling fine-grained control and dynamic scene evolution.
 
 ## 🤗 Matrix-Game-2.0 Model
 we provide three pretrained model weights including universal scenes, GTA driving scene and TempleRun game scene. Please refer to our HuggingFace page to reach these resources.
@@ -34,9 +29,9 @@ conda create -n matrix-game-2.0 python=3.10 -y
 conda activate matrix-game-2.0
 pip install -r requirements.txt
 # install apex and FlashAttention
-# Our project also depends on [apex](https://github.com/NVIDIA/apex) and [FlashAttention](https://github.com/Dao-AILab/flash-attention)
-git clone https://github.com/SkyworkAI/Matrix-Game-2.0.git
-cd Matrix-Game-2.0
+# Our project also depends on [FlashAttention](https://github.com/Dao-AILab/flash-attention)
+git clone https://github.com/SkyworkAI/Matrix-Game.git
+cd Matrix-Game-2
 python setup.py develop
 ```
 

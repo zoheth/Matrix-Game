@@ -9,6 +9,7 @@ from utils.wan_wrapper import WanDiffusionWrapper, WanVAEWrapper
 from utils.visualize import process_video
 import torch.nn.functional as F
 from demo_utils.constant import ZERO_VAE_CACHE
+from tqdm import tqdm
 
 def get_current_action(mode="universal"):
 
@@ -136,13 +137,14 @@ class CausalInferencePipeline(torch.nn.Module):
             args,
             device="cuda",
             generator=None,
+            vae_decoder=None,
     ):
         super().__init__()
         # Step 1: Initialize all models
         self.generator = WanDiffusionWrapper(
             **getattr(args, "model_kwargs", {}), is_causal=True) if generator is None else generator
             
-
+        self.vae_decoder = vae_decoder
         # Step 2: Initialize all causal hyperparmeters
         self.scheduler = self.generator.get_scheduler()
         self.denoising_step_list = torch.tensor(
@@ -172,8 +174,8 @@ class CausalInferencePipeline(torch.nn.Module):
         conditional_dict,
         initial_latent = None,
         return_latents = False,
-        vae = None,
         mode = 'universal',
+        profile = False,
     ) -> torch.Tensor:
         """
         Perform inference on the given noise and text prompts.
@@ -276,18 +278,19 @@ class CausalInferencePipeline(torch.nn.Module):
 
         # Step 3: Temporal denoising loop
         all_num_frames = [self.num_frame_per_block] * num_blocks
-
-        for current_num_frames in all_num_frames:
+        if profile:
+            diffusion_start = torch.cuda.Event(enable_timing=True)
+            diffusion_end = torch.cuda.Event(enable_timing=True)
+        for current_num_frames in tqdm(all_num_frames):
 
             noisy_input = noise[
                 :, :, current_start_frame - num_input_frames:current_start_frame + current_num_frames - num_input_frames]
 
             # Step 3.1: Spatial denoising loop
-            
+            if profile:
+                torch.cuda.synchronize()
+                diffusion_start.record()
             for index, current_timestep in enumerate(self.denoising_step_list):
-                
-                
-                print(f"current_timestep: {current_timestep}")
                 # set current timestep
                 timestep = torch.ones(
                     [batch_size, current_num_frames],
@@ -347,8 +350,16 @@ class CausalInferencePipeline(torch.nn.Module):
             current_start_frame += current_num_frames
 
             denoised_pred = denoised_pred.transpose(1,2)
-            video, vae_cache = vae(denoised_pred.half(), *vae_cache)
+            video, vae_cache = self.vae_decoder(denoised_pred.half(), *vae_cache)
             videos += [video]
+
+            if profile:
+                torch.cuda.synchronize()
+                diffusion_end.record()
+                diffusion_time = diffusion_start.elapsed_time(diffusion_end)
+                print(f"diffusion_time: {diffusion_time}", flush=True)
+                fps = video.shape[1]*1000/ diffusion_time
+                print(f"  - FPS: {fps:.2f}")
 
         if return_latents:
             return output
@@ -425,12 +436,14 @@ class CausalInferenceStreamingPipeline(torch.nn.Module):
             self,
             args,
             device="cuda",
+            vae_decoder=None,
             generator=None,
     ):
         super().__init__()
         # Step 1: Initialize all models
         self.generator = WanDiffusionWrapper(
             **getattr(args, "model_kwargs", {}), is_causal=True) if generator is None else generator
+        self.vae_decoder = vae_decoder
 
         # Step 2: Initialize all causal hyperparmeters
         self.scheduler = self.generator.get_scheduler()
@@ -461,7 +474,6 @@ class CausalInferenceStreamingPipeline(torch.nn.Module):
         conditional_dict,
         initial_latent: Optional[torch.Tensor] = None,
         return_latents: bool = False,
-        vae = None, 
         output_folder = None,
         name = None,
         mode = 'universal'
@@ -574,11 +586,8 @@ class CausalInferenceStreamingPipeline(torch.nn.Module):
             current_actions = get_current_action(mode=mode)
             new_act, conditional_dict = cond_current(conditional_dict, current_start_frame, self.num_frame_per_block, replace=current_actions, mode=mode)
             # Step 3.1: Spatial denoising loop
-            
+
             for index, current_timestep in enumerate(self.denoising_step_list):
-                
-                
-                print(f"current_timestep: {current_timestep}")
                 # set current timestep
                 timestep = torch.ones(
                     [batch_size, current_num_frames],
@@ -636,7 +645,7 @@ class CausalInferenceStreamingPipeline(torch.nn.Module):
 
             # Step 3.4: update the start and end frame indices
             denoised_pred = denoised_pred.transpose(1,2)
-            video, vae_cache = vae(denoised_pred.half(), *vae_cache)
+            video, vae_cache = self.vae_decoder(denoised_pred.half(), *vae_cache)
             videos += [video]
             video = rearrange(video, "B T C H W -> B T H W C")
             video = ((video.float() + 1) * 127.5).clip(0, 255).cpu().numpy().astype(np.uint8)[0]

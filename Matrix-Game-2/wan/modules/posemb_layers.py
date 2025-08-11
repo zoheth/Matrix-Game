@@ -104,11 +104,12 @@ def reshape_for_broadcast(
                 for i, d in enumerate(x.shape)
             ]
         else:
-            assert freqs_cis[0].shape == (
-                x.shape[1],
-                x.shape[-1],
-            ), f"freqs_cis shape {freqs_cis[0].shape} does not match x shape {x.shape}"
-            shape = [d if i == 1 or i == ndim - 1 else 1 for i, d in enumerate(x.shape)]
+            # assert freqs_cis[0].shape == (
+            #     x.shape[1],
+            #     x.shape[-1],
+            # ), f"freqs_cis shape {freqs_cis[0].shape} does not match x shape {x.shape}"
+            # shape = [d if i == 1 or i == ndim - 1 else 1 for i, d in enumerate(x.shape)]
+            shape = [1, freqs_cis[0].shape[0], 1, freqs_cis[0].shape[1]]
         return freqs_cis[0].view(*shape), freqs_cis[1].view(*shape)
     else:
         # freqs_cis: values in complex space
@@ -142,6 +143,7 @@ def apply_rotary_emb(
     xk: torch.Tensor,
     freqs_cis: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
     head_first: bool = False,
+    start_offset: int = 0,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Apply rotary embeddings to input tensors using the given frequency tensor.
@@ -169,8 +171,8 @@ def apply_rotary_emb(
         cos, sin = cos.to(xq.device), sin.to(xq.device)
         # real * cos - imag * sin
         # imag * cos + real * sin
-        xq_out = (xq.float() * cos[:, :xq.shape[1], :, :] + rotate_half(xq.float()) * sin[:, :xq.shape[1], :, :]).type_as(xq)
-        xk_out = (xk.float() * cos[:, :xk.shape[1], :, :] + rotate_half(xk.float()) * sin[:, :xk.shape[1], :, :]).type_as(xk)
+        xq_out = (xq.float() * cos[:, start_offset:start_offset + xq.shape[1], :, :] + rotate_half(xq.float()) * sin[:, start_offset:start_offset + xq.shape[1], :, :]).type_as(xq)
+        xk_out = (xk.float() * cos[:, start_offset:start_offset + xk.shape[1], :, :] + rotate_half(xk.float()) * sin[:, start_offset:start_offset + xk.shape[1], :, :]).type_as(xk)
     else:
         # view_as_complex will pack [..., D/2, 2](real) to [..., D/2](complex)
         xq_ = torch.view_as_complex(

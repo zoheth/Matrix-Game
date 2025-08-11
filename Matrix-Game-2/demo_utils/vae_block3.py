@@ -153,7 +153,7 @@ class VAEDecoderWrapper(nn.Module):
         # to [batch_size, num_channels, num_frames, height, width]
         z = z.permute(0, 2, 1, 3, 4)
         feat_cache = list(feat_cache)
-        print("Length of feat_cache: ", len(feat_cache))
+        # print("Length of feat_cache: ", len(feat_cache))
 
         device, dtype = z.device, z.dtype
         scale = [self.mean.to(device=device, dtype=dtype),

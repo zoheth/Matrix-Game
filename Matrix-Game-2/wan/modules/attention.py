@@ -8,7 +8,7 @@ try:
         if not torch.cuda.is_available():
             return False
         device_name = torch.cuda.get_device_name(0).lower()
-        return "h100" in device_name or "hopper" in device_name or "h800" in device_name
+        return "h100" in device_name or "hopper" in device_name or "l20y" in device_name or "h800" in device_name
     FLASH_ATTN_3_AVAILABLE = is_hopper_gpu()
 except ModuleNotFoundError:
     FLASH_ATTN_3_AVAILABLE = False
