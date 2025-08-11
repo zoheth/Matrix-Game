@@ -5,9 +5,8 @@
 
 <font size=7><div align='center' >  [[🤗 HuggingFace](https://huggingface.co/Skywork/Matrix-Game-2.0)] [[📖 Technical Report](assets/pdf/report.pdf)] [[🚀 Project Website](https://matrix-game-v2.github.io/)] </div></font>
 
-
 <div align="center">
-  <img src="assets/videos/matrix-game2.mp4" alt="teaser" />
+  <video src="assets/videos/matrix-game2.mp4" width="70%" poster=""> </video>
 </div>
 
 ## 📝 Overview
