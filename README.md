@@ -17,14 +17,3 @@ This repository provides the official implementations of Matrix-Game-1.0 and Mat
 ## 📄 License
 
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
-
-## Citation
-If you find this codebase useful for your research, please kindly cite our paper:
-```
-@article{zhang2025matrixgame,
-  title     = {Matrix-Game: Interactive World Foundation Model},
-  author    = {Yifan Zhang and Chunli Peng and Boyang Wang and Puyi Wang and Qingcheng Zhu and Fei Kang and Biao Jiang and Zedong Gao and Eric Li and Yang Liu and Yahui Zhou},
-  journal   = {arXiv preprint arXiv:2506.18701},
-  year      = {2025}
-}
-```
