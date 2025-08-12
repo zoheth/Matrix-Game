@@ -9,9 +9,7 @@
 
 This repository provides the official implementations of Matrix-Game-1.0 and Matrix-Game-2.0.
 
-<div align="center">
-  <img src="Matrix-Game-2/assets/images/cover.png" alt="teaser" />
-</div>
+https://github.com/user-attachments/assets/336b0d4a-64f5-4e5c-9b60-6212ddb261c0
 
 ## 🔥🔥🔥 News!!
 * Aug 12, 2025: 🔥 We released [Matrix-Game-2.0](https://github.com/SkyworkAI/Matrix-Game/tree/main/Matrix-Game-2). This is an interactive world foundation model for real-time long video generation.
