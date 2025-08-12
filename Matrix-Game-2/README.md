@@ -60,6 +60,11 @@ python inference_streaming.py \
     --seed 42 \
     --pretrained_model_path {path-to-the-vae-folder}
 ```
+
+### Tips
+- In the current version, upward movement for camera may cause brief rendering glitches (e.g., black screens). A fix is planned for future updates. Adjust movement slightly or change direction to resolve it.
+
+
 ## ⭐ Acknowledgements
 
 We would like to express our gratitude to:
