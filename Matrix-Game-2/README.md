@@ -3,7 +3,7 @@
 <h3 align="center">An Open-Source, Real-Time, and Streaming Interactive World Model</h3>
 </p>
 
-<font size=7><div align='center' >  [[🤗 HuggingFace](https://huggingface.co/Skywork/Matrix-Game-2.0)] [[📖 Technical Report](assets/pdf/report.pdf)] [[🚀 Project Website](https://matrix-game-v2.github.io/)] </div></font>
+<font size=7><div align='center' >  [[🤗 HuggingFace](https://huggingface.co/Skywork/Matrix-Game-2.0)] [[📖 Technical Report](assets/pdf/report.pdf?download=1)] [[🚀 Project Website](https://matrix-game-v2.github.io/)] </div></font>
 
 https://github.com/user-attachments/assets/336b0d4a-64f5-4e5c-9b60-6212ddb261c0
 
