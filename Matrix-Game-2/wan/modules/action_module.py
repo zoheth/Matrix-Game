@@ -204,6 +204,9 @@ class ActionModule(nn.Module):
         assert ((N_frames - 1) + self.vae_time_compression_ratio) % self.vae_time_compression_ratio == 0
         N_feats = int((N_frames - 1) / self.vae_time_compression_ratio) + 1
         
+        # Defined freqs_cis early so it's available for both mouse and keyboard
+        freqs_cis = (self.freqs_cos, self.freqs_sin)
+
         assert (N_feats == tt and ((is_causal and kv_cache_mouse == None) or not is_causal)) or ((N_frames - 1) // self.vae_time_compression_ratio + 1 == start_frame + num_frame_per_block and is_causal)
         
         if self.enable_mouse and mouse_condition is not None:
@@ -237,7 +240,11 @@ class ActionModule(nn.Module):
             q = self.img_attn_q_norm(q).to(v)
             k = self.img_attn_k_norm(k).to(v)        
             # rope embd
-            freqs_cis = (self.freqs_cos, self.freqs_sin)
+
+            
+            # freqs_cis = (self.freqs_cos, self.freqs_sin)
+            
+            
             q, k = apply_rotary_emb(q, k, freqs_cis, start_offset = start_frame, head_first=False)
             ## TODO: adding cache here
             if is_causal:
