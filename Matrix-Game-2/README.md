@@ -10,6 +10,8 @@ https://github.com/user-attachments/assets/336b0d4a-64f5-4e5c-9b60-6212ddb261c0
 ## 📝 Overview
 **Matrix-Game-2.0** is an interactive world foundation model for real-time long video generation.  Built upon an auto-regressive diffusion-based image-to-world framework, it can generate real-time[25fps] long videos conditioned on keyboard and mouse inputs, enabling fine-grained control and dynamic scene evolution.
 
+**Related Project**:  If you want to create explorable large-scale 3D scene which can be seamlessly integrated into games or VR applications, please visit [Matrix-3D](https://github.com/SkyworkAI/Matrix-3D) for details.
+
 ## 🤗 Matrix-Game-2.0 Model
 we provide three pretrained model weights including universal scenes, GTA driving scene and TempleRun game scene. Please refer to our HuggingFace page to reach these resources.
 
