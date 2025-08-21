@@ -16,7 +16,7 @@ This repository provides the official implementations of Matrix-Game-1.0 and Mat
 
 https://github.com/user-attachments/assets/336b0d4a-64f5-4e5c-9b60-6212ddb261c0
 
-
+**Related Project**:  If you want to create explorable large-scale 3D scene which can be seamlessly integrated into games or VR applications, please visit [Matrix-3D](https://github.com/SkyworkAI/Matrix-3D) for details.
 
 ## 📄 License
 
