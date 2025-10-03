@@ -214,7 +214,6 @@ class ReprojectionErrorMetric(BaseMetric):
             self.droid.track(t, image, intrinsics=intrinsics)
 
         traj_est, valid_errors = self.droid.terminate(image_stream(video_path, self._args.stride, self._args.calib))
-        print(traj_est, valid_errors)
         
         if len(valid_errors) > 0:
             mean_error = valid_errors.mean().item()
