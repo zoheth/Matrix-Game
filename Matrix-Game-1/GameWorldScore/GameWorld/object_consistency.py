@@ -237,7 +237,7 @@ def ThreeDimensional_consistency(video_list, droid_path):
     
 def compute_object_consistency(json_dir, device, submodules_list, **kwargs):
     droid_path = submodules_list[0]
-    video_list, _ = load_dimension_info(json_dir, dimension='action_control', lang='en')
+    video_list, _ = load_dimension_info(json_dir, dimension='object_consistency', lang='en')
     video_list = distribute_list_to_rank(video_list)
 
     all_results, video_results = ThreeDimensional_consistency(video_list, droid_path)
