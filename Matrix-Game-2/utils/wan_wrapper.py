@@ -148,7 +148,7 @@ class WanDiffusionWrapper(torch.nn.Module):
         current_start: Optional[int] = None,
         cache_start: Optional[int] = None
     ) -> torch.Tensor:
-    
+
         assert noisy_image_or_video.shape[1] == 16
         # [B, F] -> [B]
         if self.uniform_timestep:
@@ -157,29 +157,33 @@ class WanDiffusionWrapper(torch.nn.Module):
             input_timestep = timestep
         logits = None
 
-        if kv_cache is not None:
-            flow_pred = self.model(
-                noisy_image_or_video.to(self.model.dtype),#.permute(0, 2, 1, 3, 4),
-                t=input_timestep, **conditional_dict,
-                # seq_len=self.seq_len,
-                kv_cache=kv_cache,
-                kv_cache_mouse=kv_cache_mouse, kv_cache_keyboard=kv_cache_keyboard,
-                crossattn_cache=crossattn_cache,
-                current_start=current_start,
-                cache_start=cache_start
-            )#.permute(0, 2, 1, 3, 4)
-            
-        else:
-            flow_pred = self.model(
-                noisy_image_or_video.to(self.model.dtype),#.permute(0, 2, 1, 3, 4),
-                t=input_timestep, **conditional_dict)
-            #.permute(0, 2, 1, 3, 4)
-        pred_x0 = self._convert_flow_pred_to_x0(
-            flow_pred=rearrange(flow_pred, 'b c f h w -> (b f) c h w'),#.flatten(0, 1),
-            xt=rearrange(noisy_image_or_video, 'b c f h w -> (b f) c h w'),#.flatten(0, 1),
-            timestep=timestep.flatten(0, 1)
-        )# .unflatten(0, flow_pred.shape[:2])
-        pred_x0 = rearrange(pred_x0, '(b f) c h w -> b c f h w', b=flow_pred.shape[0])
+        with torch.profiler.record_function("DiffusionModel_Forward"):
+            if kv_cache is not None:
+                flow_pred = self.model(
+                    noisy_image_or_video.to(self.model.dtype),#.permute(0, 2, 1, 3, 4),
+                    t=input_timestep, **conditional_dict,
+                    # seq_len=self.seq_len,
+                    kv_cache=kv_cache,
+                    kv_cache_mouse=kv_cache_mouse, kv_cache_keyboard=kv_cache_keyboard,
+                    crossattn_cache=crossattn_cache,
+                    current_start=current_start,
+                    cache_start=cache_start
+                )#.permute(0, 2, 1, 3, 4)
+
+            else:
+                flow_pred = self.model(
+                    noisy_image_or_video.to(self.model.dtype),#.permute(0, 2, 1, 3, 4),
+                    t=input_timestep, **conditional_dict)
+                #.permute(0, 2, 1, 3, 4)
+
+        with torch.profiler.record_function("Flow_to_X0_Conversion"):
+            pred_x0 = self._convert_flow_pred_to_x0(
+                flow_pred=rearrange(flow_pred, 'b c f h w -> (b f) c h w'),#.flatten(0, 1),
+                xt=rearrange(noisy_image_or_video, 'b c f h w -> (b f) c h w'),#.flatten(0, 1),
+                timestep=timestep.flatten(0, 1)
+            )# .unflatten(0, flow_pred.shape[:2])
+            pred_x0 = rearrange(pred_x0, '(b f) c h w -> b c f h w', b=flow_pred.shape[0])
+
         if logits is not None:
             return flow_pred, pred_x0, logits
 
