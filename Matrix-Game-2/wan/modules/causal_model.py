@@ -276,29 +276,32 @@ class CausalWanAttentionBlock(nn.Module):
         """
         assert e.ndim == 4
         num_frames, frame_seqlen = e.shape[1], x.shape[1] // e.shape[1]
-        
-        e = (self.modulation.unsqueeze(1) + e).chunk(6, dim=2)
-        
-        y = self.self_attn(
-            (self.norm1(x).unflatten(dim=1, sizes=(num_frames, frame_seqlen)) * (1 + e[1]) + e[0]).flatten(1, 2),
-            seq_lens, grid_sizes,
-            freqs, block_mask, kv_cache, current_start, cache_start)
 
+        e = (self.modulation.unsqueeze(1) + e).chunk(6, dim=2)
+
+        with torch.profiler.record_function("CausalWanAttentionBlock/self_attn"):
+            y = self.self_attn(
+                (self.norm1(x).unflatten(dim=1, sizes=(num_frames, frame_seqlen)) * (1 + e[1]) + e[0]).flatten(1, 2),
+                seq_lens, grid_sizes,
+                freqs, block_mask, kv_cache, current_start, cache_start)
 
         x = x + (y.unflatten(dim=1, sizes=(num_frames, frame_seqlen)) * e[2]).flatten(1, 2)
 
         # cross-attention & ffn function
         def cross_attn_ffn(x, context, e, mouse_cond, keyboard_cond, block_mask_mouse, block_mask_keyboard, kv_cache_mouse=None, kv_cache_keyboard=None, crossattn_cache=None, start_frame=0, use_rope_keyboard=False, num_frame_per_block=3):
-            x = x + self.cross_attn(self.norm3(x.to(context.dtype)), context, crossattn_cache=crossattn_cache)
+            with torch.profiler.record_function("CausalWanAttentionBlock/cross_attn"):
+                x = x + self.cross_attn(self.norm3(x.to(context.dtype)), context, crossattn_cache=crossattn_cache)
             if self.action_model is not None:
                 assert mouse_cond is not None or keyboard_cond is not None
-                x = self.action_model(x.to(context.dtype), grid_sizes[0], grid_sizes[1], grid_sizes[2], mouse_cond, keyboard_cond, block_mask_mouse, block_mask_keyboard, is_causal=True, kv_cache_mouse=kv_cache_mouse, kv_cache_keyboard=kv_cache_keyboard, start_frame=start_frame, use_rope_keyboard=use_rope_keyboard, num_frame_per_block=num_frame_per_block)
-            
-            y = self.ffn(
-                (self.norm2(x).unflatten(dim=1, sizes=(num_frames,
-                 frame_seqlen)) * (1 + e[4]) + e[3]).flatten(1, 2)
-            )
-            
+                with torch.profiler.record_function("CausalWanAttentionBlock/action_module"):
+                    x = self.action_model(x.to(context.dtype), grid_sizes[0], grid_sizes[1], grid_sizes[2], mouse_cond, keyboard_cond, block_mask_mouse, block_mask_keyboard, is_causal=True, kv_cache_mouse=kv_cache_mouse, kv_cache_keyboard=kv_cache_keyboard, start_frame=start_frame, use_rope_keyboard=use_rope_keyboard, num_frame_per_block=num_frame_per_block)
+
+            with torch.profiler.record_function("CausalWanAttentionBlock/ffn"):
+                y = self.ffn(
+                    (self.norm2(x).unflatten(dim=1, sizes=(num_frames,
+                     frame_seqlen)) * (1 + e[4]) + e[3]).flatten(1, 2)
+                )
+
             x = x + (y.unflatten(dim=1, sizes=(num_frames,
                      frame_seqlen)) * e[5]).flatten(1, 2)
             return x
@@ -661,19 +664,23 @@ class CausalWanModel(ModelMixin, ConfigMixin, FromOriginalModelMixin, PeftAdapte
         x = torch.cat([x, cond_concat], dim=1) # B C' F H W
 
         # embeddings
-        x = self.patch_embedding(x)
-        grid_sizes = torch.tensor(x.shape[2:], dtype=torch.long)
-        x = x.flatten(2).transpose(1, 2) # B FHW C'
-        seq_lens = torch.tensor([u.size(0) for u in x], dtype=torch.long)
-        assert seq_lens[0] <= 15 * 1 * 880
-        
-        e = self.time_embedding(
-            sinusoidal_embedding_1d(self.freq_dim, t.flatten()).type_as(x))
-        e0 = self.time_projection(e).unflatten(
-            1, (6, self.dim)).unflatten(dim=0, sizes=t.shape)
+        with torch.profiler.record_function("CausalWanModel/patch_embedding"):
+            x = self.patch_embedding(x)
+            grid_sizes = torch.tensor(x.shape[2:], dtype=torch.long)
+            x = x.flatten(2).transpose(1, 2) # B FHW C'
+            seq_lens = torch.tensor([u.size(0) for u in x], dtype=torch.long)
+            assert seq_lens[0] <= 15 * 1 * 880
+
+        with torch.profiler.record_function("CausalWanModel/time_embedding"):
+            e = self.time_embedding(
+                sinusoidal_embedding_1d(self.freq_dim, t.flatten()).type_as(x))
+            e0 = self.time_projection(e).unflatten(
+                1, (6, self.dim)).unflatten(dim=0, sizes=t.shape)
+
         # context
-        context_lens = None
-        context = self.img_emb(visual_context)
+        with torch.profiler.record_function("CausalWanModel/visual_embedding"):
+            context_lens = None
+            context = self.img_emb(visual_context)
         # arguments
         kwargs = dict(
             e=e0,
@@ -696,40 +703,44 @@ class CausalWanModel(ModelMixin, ConfigMixin, FromOriginalModelMixin, PeftAdapte
                 return module(*inputs, **kwargs)
             return custom_forward
 
-        for block_index, block in enumerate(self.blocks):
-            if torch.is_grad_enabled() and self.gradient_checkpointing:
-                kwargs.update(
-                    {
-                        "kv_cache": kv_cache[block_index],
-                        "kv_cache_mouse": kv_cache_mouse[block_index],
-                        "kv_cache_keyboard": kv_cache_keyboard[block_index],
-                        "current_start": current_start,
-                        "cache_start": cache_start,
-                    }
-                
-                )
-                x = torch.utils.checkpoint.checkpoint(
-                    create_custom_forward(block),
-                    x, **kwargs,
-                    use_reentrant=False,
-                )
-            else:
-                kwargs.update(
-                    {
-                        "kv_cache": kv_cache[block_index],
-                        "kv_cache_mouse": kv_cache_mouse[block_index],
-                        "kv_cache_keyboard": kv_cache_keyboard[block_index],
-                        "crossattn_cache": crossattn_cache[block_index],
-                        "current_start": current_start,
-                        "cache_start": cache_start,
-                    }
-                )
-                x = block(x, **kwargs)
+        with torch.profiler.record_function("CausalWanModel/transformer_blocks"):
+            for block_index, block in enumerate(self.blocks):
+                with torch.profiler.record_function(f"CausalWanModel/block_{block_index}"):
+                    if torch.is_grad_enabled() and self.gradient_checkpointing:
+                        kwargs.update(
+                            {
+                                "kv_cache": kv_cache[block_index],
+                                "kv_cache_mouse": kv_cache_mouse[block_index],
+                                "kv_cache_keyboard": kv_cache_keyboard[block_index],
+                                "current_start": current_start,
+                                "cache_start": cache_start,
+                            }
+
+                        )
+                        x = torch.utils.checkpoint.checkpoint(
+                            create_custom_forward(block),
+                            x, **kwargs,
+                            use_reentrant=False,
+                        )
+                    else:
+                        kwargs.update(
+                            {
+                                "kv_cache": kv_cache[block_index],
+                                "kv_cache_mouse": kv_cache_mouse[block_index],
+                                "kv_cache_keyboard": kv_cache_keyboard[block_index],
+                                "crossattn_cache": crossattn_cache[block_index],
+                                "current_start": current_start,
+                                "cache_start": cache_start,
+                            }
+                        )
+                        x = block(x, **kwargs)
 
         # head
-        x = self.head(x, e.unflatten(dim=0, sizes=t.shape).unsqueeze(2))
+        with torch.profiler.record_function("CausalWanModel/head"):
+            x = self.head(x, e.unflatten(dim=0, sizes=t.shape).unsqueeze(2))
         # unpatchify
-        x = self.unpatchify(x, grid_sizes)
+        with torch.profiler.record_function("CausalWanModel/unpatchify"):
+            x = self.unpatchify(x, grid_sizes)
         return x 
 
     def _forward_train(

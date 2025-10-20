@@ -6,19 +6,22 @@ This module provides an optimized version of CausalWanModel with:
 - Better memory efficiency
 - Optional torch.compile support
 - Optional CUDA Graph support
-
-Author: Your Name
-Date: 2025-10-08
 """
 
 import torch
 import torch.nn as nn
 from typing import List, Optional, Dict
-from wan.modules.causal_model import CausalWanModel
-import math
+
+from diffusers.loaders import FromOriginalModelMixin, PeftAdapterMixin
+from torch.nn.attention.flex_attention import create_block_mask, flex_attention
+from diffusers.configuration_utils import ConfigMixin, register_to_config
+from torch.nn.attention.flex_attention import BlockMask
+from diffusers.models.modeling_utils import ModelMixin
+
+from wan.modules.posemb_layers import get_nd_rotary_pos_embed
 
 
-class OptimizedCausalWanModel(CausalWanModel):
+class OptimizedCausalWanModel(ModelMixin, ConfigMixin, FromOriginalModelMixin, PeftAdapterMixin):
     """
     Optimized version of CausalWanModel targeting DiffusionModel_Forward bottleneck.
 
@@ -27,34 +30,41 @@ class OptimizedCausalWanModel(CausalWanModel):
     2. TODO: e.g., "Fused attention kernels"
     3. TODO: e.g., "Static KV cache management"
     """
-
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-
-        # TODO: Add your optimization-specific initialization
-        # Examples:
-        # - Pre-allocate buffers
-        # - Compile critical sections
-        # - Register custom operators
-
-        self._init_optimizations()
-
-    def _init_optimizations(self):
-        """Initialize optimization-specific components"""
-        # TODO: Implement your optimizations here
-
-        # Example 1: Compile specific modules
-        # self.time_embedding = torch.compile(self.time_embedding, mode="reduce-overhead")
-
-        # Example 2: Pre-allocate buffers to avoid dynamic allocation
-        # self.register_buffer('_temp_buffer', torch.zeros(...))
-
-        # Example 3: Replace modules with optimized versions
-        # for block in self.blocks:
-        #     block.self_attn = OptimizedAttention(block.self_attn)
-
-        pass
-
+    
+    @register_to_config
+    def __init__(self,
+                 patch_size=(1, 2, 2),
+                 text_len=512,
+                 in_dim=36,
+                 dim=1536,
+                 ffn_dim=8960,
+                 freq_dim=256,
+                 text_dim=4096,
+                 out_dim=16,
+                 num_heads=12,
+                 num_layers=30,
+                 local_attn_size=-1,
+                 sink_size=0,
+                 qk_norm=True,
+                 cross_attn_norm=True,
+                 action_config={},
+                 eps=1e-6):
+        
+        self.patch_embedding = nn.Conv3d(
+            in_dim, dim, kernel_size=patch_size, stride=patch_size)
+        
+        self.time_embedding = nn.Sequential(
+            nn.Linear(freq_dim, dim), nn.SiLU(), nn.Linear(dim, dim)
+        )
+        self.time_projection = nn.Sequential(
+            nn.SiLU(), nn.Linear(dim, dim * 6)
+        )
+        
+        cross_attn_type = 'i2v_cross_attn'
+        self.blocks = nn.ModuleList
+        
+        
+        
     def _forward_inference(
         self,
         x,
