@@ -15,8 +15,8 @@ class IActionPreprocessor(nn.Module, ABC):
     """ (B, N_frames, C) -> (B, T_q_or_k, C_windowed)"""
     def __init__(self, vae_time_compression_ratio: int, windows_size: int):
         super().__init__()
-        # self.vae_time_compression_ratio = vae_time_compression_ratio
-        # self.windows_size = windows_size
+        self.vae_time_compression_ratio = vae_time_compression_ratio
+        self.windows_size = windows_size
         self.pat_t = vae_time_compression_ratio * windows_size
         
     @abstractmethod
@@ -254,6 +254,8 @@ class FlashInferAttentionCore(IAttentionCore):
                 num_heads,  # Assume num_kv_heads == num_qo_heads for now
                 head_dim,
                 causal=causal,
+                q_data_type=q.dtype,  # Use actual dtype of q
+                kv_data_type=k.dtype,  # Use actual dtype of k/v
             )
 
             # Run the attention computation

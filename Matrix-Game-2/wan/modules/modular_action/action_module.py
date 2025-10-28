@@ -25,7 +25,6 @@ class ActionModule(nn.Module):
         self.freqs_cos, self.freqs_sin = self.get_rotary_pos_embed(max_video_length, th, tw, action_config.rope_dim_list, start_offset)
         
         self.injectors = nn.ModuleList()
-            
         
     def get_rotary_pos_embed(self, video_length: int, height: int, width: int, dim_list: list, start_offset: int):
         num_spatial_dims = 3

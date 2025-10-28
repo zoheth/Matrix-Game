@@ -53,13 +53,13 @@ class MousePreprocessor(IActionPreprocessor):
 
         # Extract windows
         if is_causal:
-            N_feats = (N_frames - 1) // self.pat_t + 1
+            N_feats = (N_frames - 1) // self.vae_time_compression_ratio + 1
             # Start from proper position for causal mode
-            start_idx = self.pat_t * (N_feats - num_frame_per_block - self.pat_t // self.pat_t) + pad_t
+            start_idx = self.vae_time_compression_ratio * (N_feats - num_frame_per_block - self.windows_size) + pad_t
             mouse_condition_padded = mouse_condition_padded[:, start_idx:, :]
             group_mouse = [
                 mouse_condition_padded[
-                    :, self.pat_t * (i - self.pat_t // self.pat_t) + pad_t : i * self.pat_t + pad_t, :
+                    :, self.vae_time_compression_ratio * (i - self.windows_size) + pad_t : i * self.vae_time_compression_ratio + pad_t, :
                 ]
                 for i in range(num_frame_per_block)
             ]
@@ -67,7 +67,7 @@ class MousePreprocessor(IActionPreprocessor):
             N_feats = T_q  # Should match temporal shape
             group_mouse = [
                 mouse_condition_padded[
-                    :, self.pat_t * (i - self.pat_t // self.pat_t) + pad_t : i * self.pat_t + pad_t, :
+                    :, self.vae_time_compression_ratio * (i - self.windows_size) + pad_t : i * self.vae_time_compression_ratio + pad_t, :
                 ]
                 for i in range(N_feats)
             ]
@@ -88,11 +88,12 @@ class MousePreprocessor(IActionPreprocessor):
 class KeyboardPreprocessor(IActionPreprocessor):
     """Preprocessor for keyboard condition data."""
 
-    def __init__(self, vae_time_compression_ratio: int, windows_size: int, hidden_size: int):
+    def __init__(self, vae_time_compression_ratio: int, windows_size: int,
+                 keyboard_dim_in: int, hidden_size: int):
         super().__init__(vae_time_compression_ratio, windows_size)
-        # Keyboard embedding layers
+        # Keyboard embedding layers - 将 keyboard 输入映射到 hidden_size
         self.keyboard_embed = nn.Sequential(
-            nn.Linear(hidden_size, hidden_size, bias=True),
+            nn.Linear(keyboard_dim_in, hidden_size, bias=True),
             nn.SiLU(),
             nn.Linear(hidden_size, hidden_size, bias=True),
         )
@@ -126,20 +127,20 @@ class KeyboardPreprocessor(IActionPreprocessor):
 
         # Extract windows
         if is_causal:
-            N_feats = (N_frames - 1) // self.pat_t + 1
-            start_idx = self.pat_t * (N_feats - num_frame_per_block - self.pat_t // self.pat_t) + pad_t
+            N_feats = (N_frames - 1) // self.vae_time_compression_ratio + 1
+            start_idx = self.vae_time_compression_ratio * (N_feats - num_frame_per_block - self.windows_size) + pad_t
             keyboard_condition_embedded = keyboard_condition_embedded[:, start_idx:, :]
             group_keyboard = [
                 keyboard_condition_embedded[
-                    :, self.pat_t * (i - self.pat_t // self.pat_t) + pad_t : i * self.pat_t + pad_t, :
+                    :, self.vae_time_compression_ratio * (i - self.windows_size) + pad_t : i * self.vae_time_compression_ratio + pad_t, :
                 ]
                 for i in range(num_frame_per_block)
             ]
         else:
-            N_feats = (N_frames - 1) // self.pat_t + 1
+            N_feats = (N_frames - 1) // self.vae_time_compression_ratio + 1
             group_keyboard = [
                 keyboard_condition_embedded[
-                    :, self.pat_t * (i - self.pat_t // self.pat_t) + pad_t : i * self.pat_t + pad_t, :
+                    :, self.vae_time_compression_ratio * (i - self.windows_size) + pad_t : i * self.vae_time_compression_ratio + pad_t, :
                 ]
                 for i in range(N_feats)
             ]
@@ -299,6 +300,7 @@ class KeyboardInjector(IAttentionInjector):
         self.preprocessor = KeyboardPreprocessor(
             action_config.vae_time_compression_ratio,
             action_config.windows_size,
+            action_config.keyboard_dim_in,
             action_config.hidden_size,
         )
 

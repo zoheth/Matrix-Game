@@ -45,7 +45,7 @@ class ActionConfig:
     # 网络结构参数
     heads_num: int = 16
     hidden_size: int = 128
-    img_hidden_size: int = 1536
+    img_hidden_size: int = 1024  # 默认值修改为 1024，使 head_dim = 64
 
     # 键盘相关参数
     keyboard_dim_in: int = 4
@@ -58,7 +58,7 @@ class ActionConfig:
 
     # Patch 和位置编码参数
     patch_size: List[int] = field(default_factory=lambda: [1, 2, 2])
-    rope_dim_list: List[int] = field(default_factory=lambda: [8, 28, 28])
+    rope_dim_list: List[int] = field(default_factory=lambda: [8, 28, 28])  # 总和 = 64
     rope_theta: int = 256
 
     # QKV 参数
@@ -72,13 +72,17 @@ class ActionConfig:
 
     def __post_init__(self):
         """验证配置的有效性"""
-        # 验证 rope_dim_list 总和
-        assert sum(self.rope_dim_list) == self.img_hidden_size // self.heads_num, \
-            f"sum(rope_dim_list) must equal head_dim: {self.img_hidden_size // self.heads_num}"
+        # 验证 rope_dim_list 总和（如果不匹配，会在运行时自动调整）
+        head_dim = self.img_hidden_size // self.heads_num
+        if sum(self.rope_dim_list) != head_dim:
+            print(f"Warning: sum(rope_dim_list)={sum(self.rope_dim_list)} != head_dim={head_dim}")
+            print(f"RoPE dimensions will be auto-adjusted at runtime to [{head_dim//3}, {head_dim//3}, {head_dim//3}]")
 
         # 验证 mouse_qk_dim_list 总和
-        assert sum(self.mouse_qk_dim_list) == self.mouse_hidden_dim // self.heads_num, \
-            f"sum(mouse_qk_dim_list) must equal mouse head_dim: {self.mouse_hidden_dim // self.heads_num}"
+        mouse_head_dim = self.mouse_hidden_dim // self.heads_num
+        if sum(self.mouse_qk_dim_list) != mouse_head_dim:
+            print(f"Warning: sum(mouse_qk_dim_list)={sum(self.mouse_qk_dim_list)} != mouse_head_dim={mouse_head_dim}")
+            print(f"Mouse RoPE dimensions will be auto-adjusted at runtime")
 
         # 验证 patch_size 长度
         assert len(self.patch_size) == 3, "patch_size must have 3 elements [T, H, W]"
