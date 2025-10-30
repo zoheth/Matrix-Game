@@ -361,8 +361,8 @@ class CausalInferencePipeline(torch.nn.Module):
                     videos += [video]
 
                 if profile:
-                    torch.cuda.synchronize()
                     diffusion_end.record()
+                    torch.cuda.synchronize()  # 确保所有 CUDA 操作完成
                     diffusion_time = diffusion_start.elapsed_time(diffusion_end)
                     print(f"diffusion_time: {diffusion_time}", flush=True)
                     fps = video.shape[1]*1000/ diffusion_time

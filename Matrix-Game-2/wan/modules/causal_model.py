@@ -16,8 +16,22 @@ from diffusers.models.modeling_utils import ModelMixin
 import torch.nn as nn
 import torch
 import math
+import os
 import torch.distributed as dist
-from .action_module import ActionModule
+
+# 允许通过环境变量选择使用模块化版本
+USE_MODULAR_ACTION = os.environ.get("USE_MODULAR_ACTION", "1") == "1"
+
+if USE_MODULAR_ACTION:
+    try:
+        from .modular_action import ActionModule
+        print("[INFO] Using modular ActionModule implementation")
+    except ImportError as e:
+        print(f"[WARNING] Failed to import modular ActionModule: {e}")
+        print("[INFO] Falling back to original ActionModule")
+        from .action_module import ActionModule
+else:
+    from .action_module import ActionModule
 
 # wan 1.3B model has a weird channel / head configurations and require max-autotune to work with flexattention
 # see https://github.com/pytorch/pytorch/issues/133254

@@ -294,8 +294,10 @@ def test_streaming_continuation(device='cuda'):
     # 模拟多步推理
     for step in range(3):
         num_feats = 3
-        num_frames = (num_feats - 1) * 4 + 1  # 9
         start_frame = step * 3
+        # 累积帧数：从开始到当前块的结束
+        total_feats = start_frame + num_feats
+        num_frames = (total_feats - 1) * 4 + 1  # 累积的总帧数
 
         hidden_states = torch.randn(B, num_feats * S, img_hidden_size, device=device, dtype=dtype)
         mouse_condition = torch.randn(B, num_frames, 2, device=device, dtype=dtype)
@@ -425,8 +427,10 @@ def test_cache_sliding_window(device='cuda'):
     # 推理直到超过 cache 大小，触发滑动窗口
     for step in range(8):  # 8 steps × 3 frames = 24 frames > 20 cache_size
         num_feats = 3
-        num_frames = (num_feats - 1) * 4 + 1  # 9
         start_frame = step * 3
+        # 累积帧数：从开始到当前块的结束
+        total_feats = start_frame + num_feats
+        num_frames = (total_feats - 1) * 4 + 1  # 累积的总帧数
 
         hidden_states = torch.randn(B, num_feats * S, img_hidden_size, device=device, dtype=dtype)
         mouse_condition = torch.randn(B, num_frames, 2, device=device, dtype=dtype)
@@ -504,6 +508,8 @@ def main():
         results.append(("流式后续 Chunk", test_streaming_continuation(device)))
     except Exception as e:
         print(f"\033[91m✗ 流式后续 Chunk 失败: {e}\033[0m")
+        import traceback
+        traceback.print_exc()
         results.append(("流式后续 Chunk", False))
 
     try:
@@ -516,6 +522,8 @@ def main():
         results.append(("滑动窗口机制", test_cache_sliding_window(device)))
     except Exception as e:
         print(f"\033[91m✗ 滑动窗口机制失败: {e}\033[0m")
+        import traceback
+        traceback.print_exc()
         results.append(("滑动窗口机制", False))
 
     # 总结
