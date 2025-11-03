@@ -14,6 +14,7 @@ from wan.modules.modular_action.interfaces import (
 from wan.modules.modular_action.action_config import ActionConfig
 from wan.modules.posemb_layers import apply_rotary_emb
 
+from .kernels.preprocessor_kernel import mouse_preprocessor_triton
 
 class MousePreprocessor(IActionPreprocessor):
     """
@@ -55,13 +56,14 @@ class MousePreprocessor(IActionPreprocessor):
         if is_causal:
             N_feats = (N_frames - 1) // self.vae_time_compression_ratio + 1
             # Start from proper position for causal mode
-            start_idx = self.vae_time_compression_ratio * (N_feats - num_frame_per_block - self.windows_size) + pad_t
-            mouse_condition_padded = mouse_condition_padded[:, start_idx:, :]
+            start_global_idx = N_feats - num_frame_per_block
+            end_global_idx = N_feats
+
             group_mouse = [
                 mouse_condition_padded[
                     :, self.vae_time_compression_ratio * (i - self.windows_size) + pad_t : i * self.vae_time_compression_ratio + pad_t, :
                 ]
-                for i in range(num_frame_per_block)
+                for i in range(start_global_idx, end_global_idx)
             ]
         else:
             N_feats = T_q  # Should match temporal shape
@@ -249,7 +251,15 @@ class MouseInjector(IAttentionInjector):
         hidden_states = rearrange(x, "B (T S) C -> (B S) T C", T=T, S=S)
 
         # Fuse with mouse condition
-        fused_features = self.preprocessor(hidden_states, condition, is_causal, num_frame_per_block)
+        # fused_features = self.preprocessor(hidden_states, condition, is_causal, num_frame_per_block)
+        fused_features = mouse_preprocessor_triton(
+            hidden_states,
+            condition,
+            self.action_config.vae_time_compression_ratio,
+            self.action_config.windows_size,
+            is_causal,
+            num_frame_per_block,
+        )
 
         # MLP
         fused_features = self.mouse_mlp(fused_features)
