@@ -247,19 +247,24 @@ class MouseInjector(IAttentionInjector):
         H, W = spatial_shape
         S = H * W
 
-        # Reshape to (B*S, T, C_img)
-        hidden_states = rearrange(x, "B (T S) C -> (B S) T C", T=T, S=S)
-
-        # Fuse with mouse condition
+        # Original preprocessor (commented out in favor of triton kernel)
+        # hidden_states = rearrange(x, "B (T S) C -> (B S) T C", T=T, S=S)
         # fused_features = self.preprocessor(hidden_states, condition, is_causal, num_frame_per_block)
+
+        # Fuse with mouse condition using triton kernel (accepts B, T*S, C directly)
+        # Output: [B, S, T, C_fused]
         fused_features = mouse_preprocessor_triton(
-            hidden_states,
+            x,  # [B, T*S, C_img]
             condition,
+            T,  # temporal_shape
             self.action_config.vae_time_compression_ratio,
             self.action_config.windows_size,
             is_causal,
             num_frame_per_block,
         )
+
+        # Merge B and S dimensions: [B, S, T, C_fused] -> [B*S, T, C_fused]
+        fused_features = fused_features.reshape(B * S, T, -1)
 
         # MLP
         fused_features = self.mouse_mlp(fused_features)

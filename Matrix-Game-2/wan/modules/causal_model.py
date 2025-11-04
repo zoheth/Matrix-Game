@@ -681,7 +681,10 @@ class CausalWanModel(ModelMixin, ConfigMixin, FromOriginalModelMixin, PeftAdapte
         with torch.profiler.record_function("CausalWanModel/patch_embedding"):
             x = self.patch_embedding(x)
             grid_sizes = torch.tensor(x.shape[2:], dtype=torch.long)
-            x = x.flatten(2).transpose(1, 2) # B FHW C'
+            # Use rearrange instead of transpose to ensure contiguous output
+            # Old: x = x.flatten(2).transpose(1, 2) creates non-contiguous tensor with stride (B*C, 1, C)
+            # New: contiguous reshape with stride (B*L*C, C, 1)
+            x = x.flatten(2).transpose(1, 2).contiguous() # B C FHW -> B FHW C (contiguous)
             seq_lens = torch.tensor([u.size(0) for u in x], dtype=torch.long)
             assert seq_lens[0] <= 15 * 1 * 880
 
@@ -823,7 +826,8 @@ class CausalWanModel(ModelMixin, ConfigMixin, FromOriginalModelMixin, PeftAdapte
             )
         x = self.patch_embedding(x)
         grid_sizes = torch.tensor(x.shape[2:], dtype=torch.long)
-        x = x.flatten(2).transpose(1, 2)
+        # Ensure contiguous output after transpose
+        x = x.flatten(2).transpose(1, 2).contiguous()
         seq_lens = torch.tensor([u.size(0) for u in x], dtype=torch.long)
         e = self.time_embedding(
             sinusoidal_embedding_1d(self.freq_dim, t.flatten()).type_as(x))
