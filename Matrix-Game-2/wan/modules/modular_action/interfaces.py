@@ -4,6 +4,9 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 import torch
 from torch import nn
 
+# Import optimized KV cache implementation
+from .kernels.kv_cache_kernel import update_kv_cache_optimized
+
 if TYPE_CHECKING:
     import flashinfer
 
@@ -62,6 +65,8 @@ class KVCacheManager(nn.Module):
         """
         Update KV cache with new key-value pairs using sliding window strategy.
 
+        OPTIMIZED: Uses update_kv_cache_optimized() to minimize D2H transfers.
+
         Args:
             kv_cache: Dictionary containing 'k', 'v', 'global_end_index', 'local_end_index'
             k: New keys [BS, num_new_tokens, num_heads, head_dim]
@@ -74,47 +79,14 @@ class KVCacheManager(nn.Module):
             local_start_index: Start index in cache
             local_end_index: End index in cache
         """
-        current_start = kv_cache["global_end_index"].item()
-        current_end = current_start + num_new_tokens
-
-        kv_cache_size = kv_cache["k"].shape[1]
-        sink_tokens = self.sink_tokens
-
-        # Check if we need to evict tokens
-        if (current_end > kv_cache["global_end_index"].item()) and \
-           (num_new_tokens + kv_cache["local_end_index"].item() > kv_cache_size):
-            # Calculate eviction
-            num_evicted_tokens = num_new_tokens + kv_cache["local_end_index"].item() - kv_cache_size
-            num_rolled_tokens = kv_cache["local_end_index"].item() - num_evicted_tokens - sink_tokens
-
-            # Roll the cache: move recent tokens to make space
-            kv_cache["k"][:, sink_tokens:sink_tokens + num_rolled_tokens] = \
-                kv_cache["k"][:, sink_tokens + num_evicted_tokens:sink_tokens + num_evicted_tokens + num_rolled_tokens].clone()
-            kv_cache["v"][:, sink_tokens:sink_tokens + num_rolled_tokens] = \
-                kv_cache["v"][:, sink_tokens + num_evicted_tokens:sink_tokens + num_evicted_tokens + num_rolled_tokens].clone()
-
-            local_end_index = kv_cache["local_end_index"].item() + current_end - \
-                kv_cache["global_end_index"].item() - num_evicted_tokens
-            local_start_index = local_end_index - num_new_tokens
-        else:
-            # No eviction needed
-            local_end_index = kv_cache["local_end_index"].item() + current_end - kv_cache["global_end_index"].item()
-            local_start_index = local_end_index - num_new_tokens
-
-        # Insert new keys/values
-        kv_cache["k"][:, local_start_index:local_end_index] = k
-        kv_cache["v"][:, local_start_index:local_end_index] = v
-
-        # Update global indices
-        kv_cache["global_end_index"].fill_(current_end)
-        kv_cache["local_end_index"].fill_(local_end_index)
-
-        # Extract attention window
-        window_start = max(0, local_end_index - self.max_attention_size)
-        k_window = kv_cache["k"][:, window_start:local_end_index]
-        v_window = kv_cache["v"][:, window_start:local_end_index]
-
-        return k_window, v_window, local_start_index, local_end_index
+        return update_kv_cache_optimized(
+            kv_cache=kv_cache,
+            k=k,
+            v=v,
+            num_new_tokens=num_new_tokens,
+            max_attention_size=self.max_attention_size,
+            sink_tokens=self.sink_tokens,
+        )
 
 
 class IAttentionCore(nn.Module, ABC):
