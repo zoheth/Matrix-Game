@@ -12,7 +12,6 @@ from wan.modules.modular_action.interfaces import (
     WanRMSNorm,
 )
 from wan.modules.modular_action.action_config import ActionConfig
-from wan.modules.posemb_layers import apply_rotary_emb
 
 from .kernels.preprocessor_kernel import mouse_preprocessor_triton
 
@@ -279,18 +278,31 @@ class MouseInjector(IAttentionInjector):
         q = self.q_norm(q).to(v.dtype)
         k = self.k_norm(k).to(v.dtype)
 
-        # Apply RoPE
-        q, k = apply_rotary_emb(q, k, freqs_cis, head_first=False, start_offset=start_frame)
-
-        # Attention computation
+        # Attention computation with integrated RoPE
+        # Using FlashInfer's built-in RoPE is more efficient - it computes cos/sin on-the-fly
+        # and avoids separate kernel launches and memory transfers
         if is_causal and kv_cache is not None:
+            # For causal mode with KV cache, we need to:
+            # 1. Apply RoPE to new Q/K using FlashInfer's integrated kernel
+            # 2. Update cache with the rotated K/V
+            # 3. Get the attention window from cache
+            # 4. Compute attention
+
+            # Apply RoPE using FlashInfer's integrated kernel (more efficient than external apply_rotary_emb)
+            q_rope, k_rope = self.attn_core._apply_rope_internal(q, k, start_frame)
+
             # Update KV cache and get window
-            k_window, v_window, _, _ = self.kv_cache_manager.update_cache(kv_cache, k, v, num_frame_per_block)
-            # Compute attention with cached KV
-            attn_output = self.attn_core(q, k_window, v_window, causal=False)
+            k_window, v_window, _, _ = self.kv_cache_manager.update_cache(kv_cache, k_rope, v, num_frame_per_block)
+            # Compute attention with cached KV (RoPE already applied)
+            attn_output = self.attn_core(q_rope, k_window, v_window, causal=False, use_rope=False)
         else:
-            # Regular attention
-            attn_output = self.attn_core(q, k, v, causal=is_causal)
+            # Regular attention: use FlashInfer's integrated RoPE for best performance
+            attn_output = self.attn_core(
+                q, k, v,
+                causal=is_causal,
+                use_rope=True,
+                rope_offset=start_frame
+            )
 
         # Reshape and project: [BS, T, H, D] -> [B, T*S, C_img]
         attn_output = rearrange(attn_output, "(B S) T H D -> B (T S) (H D)", B=B, S=S)
@@ -415,24 +427,27 @@ class KeyboardInjector(IAttentionInjector):
         q = self.q_norm(q).to(v.dtype)
         k = self.k_norm(k).to(v.dtype)
 
-        # Apply RoPE to both Q and K
-        # For cross-attention with temporal alignment:
-        # Reshape Q: [B, T*S, H, D] -> [B*S, T, H, D]
+        # Reshape Q for cross-attention: [B, T*S, H, D] -> [B*S, T, H, D]
         q = rearrange(q, "B (T S) H D -> (B S) T H D", T=T, S=S)
 
-        # Apply RoPE
-        q, k = apply_rotary_emb(q, k, freqs_cis, head_first=False, start_offset=start_frame)
+        # Attention computation with integrated RoPE
+        # For cross-attention with different batch sizes, apply RoPE separately to Q and K
+        # This is most efficient: each tensor only needs one RoPE kernel call
 
-        # Expand K, V to match spatial dimension
-        # k, v: [B, T_k, H, D] -> [B*S, T_k, H, D]
-        k = k.unsqueeze(1).expand(-1, S, -1, -1, -1).reshape(B * S, -1, k.shape[-2], k.shape[-1])
-        v = v.unsqueeze(1).expand(-1, S, -1, -1, -1).reshape(B * S, -1, v.shape[-2], v.shape[-1])
+        # Apply RoPE to Q: [B*S, T, H, D] -> [B*S, T, H, D]
+        q_rope = self.attn_core._apply_rope_single(q, start_frame)
 
-        # Attention computation
+        # Apply RoPE to K: [B, T_k, H, D] -> [B, T_k, H, D]
+        k_rope = self.attn_core._apply_rope_single(k, start_frame)
+
         if is_causal and kv_cache is not None:
+            # Expand K, V to match spatial dimension: [B, T_k, H, D] -> [B*S, T_k, H, D]
+            k_rope_expanded = k_rope.unsqueeze(1).expand(-1, S, -1, -1, -1).reshape(B * S, -1, k_rope.shape[-2], k_rope.shape[-1])
+            v_expanded = v.unsqueeze(1).expand(-1, S, -1, -1, -1).reshape(B * S, -1, v.shape[-2], v.shape[-1])
+
             # Update KV cache (only store for first spatial location to save memory)
-            k_cache_update = k[: S].mean(dim=0, keepdim=True)  # Average across S or just use first
-            v_cache_update = v[: S].mean(dim=0, keepdim=True)
+            k_cache_update = k_rope_expanded[:S].mean(dim=0, keepdim=True)
+            v_cache_update = v_expanded[:S].mean(dim=0, keepdim=True)
 
             k_window, v_window, _, _ = self.kv_cache_manager.update_cache(
                 kv_cache, k_cache_update, v_cache_update, num_frame_per_block
@@ -442,11 +457,16 @@ class KeyboardInjector(IAttentionInjector):
             k_window = k_window.expand(B * S, -1, -1, -1)
             v_window = v_window.expand(B * S, -1, -1, -1)
 
-            # Compute attention with cached KV
-            attn_output = self.attn_core(q, k_window, v_window, causal=False)
+            # Compute attention with cached KV (RoPE already applied)
+            attn_output = self.attn_core(q_rope, k_window, v_window, causal=False, use_rope=False)
         else:
             # Regular cross-attention
-            attn_output = self.attn_core(q, k, v, causal=False)
+            # Expand K, V to match spatial dimension: [B, T_k, H, D] -> [B*S, T_k, H, D]
+            k_rope_expanded = k_rope.unsqueeze(1).expand(-1, S, -1, -1, -1).reshape(B * S, -1, k_rope.shape[-2], k_rope.shape[-1])
+            v_expanded = v.unsqueeze(1).expand(-1, S, -1, -1, -1).reshape(B * S, -1, v.shape[-2], v.shape[-1])
+
+            # Compute cross-attention (RoPE already applied)
+            attn_output = self.attn_core(q_rope, k_rope_expanded, v_expanded, causal=False, use_rope=False)
 
         # Reshape and project: [B*S, T, H, D] -> [B, T*S, C_img]
         attn_output = rearrange(attn_output, "(B S) T H D -> B (T S) (H D)", B=B, S=S)

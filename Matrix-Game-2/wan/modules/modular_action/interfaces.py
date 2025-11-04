@@ -1,14 +1,18 @@
 from abc import ABC, abstractmethod
-from typing import Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 import torch
 from torch import nn
+
+if TYPE_CHECKING:
+    import flashinfer
 
 try:
     import flashinfer
     FLASHINFER_AVAILABLE = True
 except ImportError:
     FLASHINFER_AVAILABLE = False
+    flashinfer = None  # type: ignore
     print("Warning: flashinfer not available, falling back to flash_attn")
 
 class IActionPreprocessor(nn.Module, ABC):
@@ -161,17 +165,130 @@ class WanRMSNorm(nn.Module):
 
 class FlashInferAttentionCore(IAttentionCore):
     """
-    FlashInfer-based attention implementation.
+    FlashInfer-based attention implementation with integrated RoPE support.
 
-    Note: RoPE should be applied externally before calling this module.
-    This implementation focuses on efficient attention computation.
+    This implementation can either:
+    1. Apply RoPE internally using flashinfer.rope.apply_rope (more efficient)
+    2. Accept pre-rotated Q/K tensors (backward compatible)
     """
 
-    def __init__(self):
+    def __init__(self, rope_scale: float = 1.0, rope_theta: float = 10000.0, interleave: bool = False):
         super().__init__()
         # Wrapper for batch prefill (created lazily on first use)
         self._batch_wrapper = None
         self._workspace_buffer = None
+
+        # RoPE parameters
+        self.rope_scale = rope_scale
+        self.rope_theta = rope_theta
+        self.interleave = interleave
+
+    def _apply_rope_internal(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        rope_offset: int = 0
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Apply RoPE using FlashInfer's efficient kernel.
+
+        This method can handle Q and K with the same batch size.
+        For cross-attention where Q and K have different batch sizes,
+        use _apply_rope_single for each tensor separately.
+
+        Args:
+            q: [BS, seq_len_q, num_heads, head_dim] - Query tensor
+            k: [BS, seq_len_k, num_heads, head_dim] - Key tensor (must have same BS as q)
+            rope_offset: Position offset for RoPE
+
+        Returns:
+            Tuple of rotated (q, k) tensors with same shapes
+        """
+        if not FLASHINFER_AVAILABLE:
+            raise RuntimeError("flashinfer is not available. Please install it first.")
+
+        BS_q, seq_len_q, num_heads, head_dim = q.shape
+        BS_k, seq_len_k, _, _ = k.shape
+
+        assert BS_q == BS_k, f"Q and K must have same batch size for joint RoPE application. Got {BS_q} vs {BS_k}"
+
+        # Flatten to ragged format: [BS, L, H, D] -> [BS*L, H, D]
+        q_ragged = q.reshape(BS_q * seq_len_q, num_heads, head_dim)
+        k_ragged = k.reshape(BS_k * seq_len_k, num_heads, head_dim)
+
+        # Create ragged tensor indices for RoPE
+        indptr = torch.arange(
+            0, (BS_q + 1) * seq_len_q, seq_len_q,
+            dtype=torch.int32, device=q.device
+        )
+        # Position offsets for each sequence in the batch
+        offsets = torch.full((BS_q,), rope_offset, dtype=torch.int32, device=q.device)
+
+        # Apply RoPE using flashinfer's efficient kernel
+        q_ragged, k_ragged = flashinfer.rope.apply_rope(  # type: ignore
+            q_ragged, k_ragged,
+            indptr=indptr,
+            offsets=offsets,
+            interleave=self.interleave,
+            rope_scale=self.rope_scale,
+            rope_theta=self.rope_theta,
+        )
+
+        # Reshape back to [BS, seq_len, num_heads, head_dim]
+        q_rope = q_ragged.reshape(BS_q, seq_len_q, num_heads, head_dim)
+        k_rope = k_ragged.reshape(BS_k, seq_len_k, num_heads, head_dim)
+
+        return q_rope, k_rope
+
+    def _apply_rope_single(
+        self,
+        x: torch.Tensor,
+        rope_offset: int = 0
+    ) -> torch.Tensor:
+        """
+        Apply RoPE to a single tensor using FlashInfer's efficient kernel.
+
+        This is useful for cross-attention where Q and K have different batch sizes
+        and need to be rotated separately.
+
+        Args:
+            x: [BS, seq_len, num_heads, head_dim] - Input tensor
+            rope_offset: Position offset for RoPE
+
+        Returns:
+            Rotated tensor with same shape
+        """
+        if not FLASHINFER_AVAILABLE:
+            raise RuntimeError("flashinfer is not available. Please install it first.")
+
+        BS, seq_len, num_heads, head_dim = x.shape
+
+        # Flatten to ragged format: [BS, L, H, D] -> [BS*L, H, D]
+        x_ragged = x.reshape(BS * seq_len, num_heads, head_dim)
+
+        # Create ragged tensor indices for RoPE
+        indptr = torch.arange(
+            0, (BS + 1) * seq_len, seq_len,
+            dtype=torch.int32, device=x.device
+        )
+        # Position offsets for each sequence in the batch
+        offsets = torch.full((BS,), rope_offset, dtype=torch.int32, device=x.device)
+
+        # Apply RoPE using flashinfer's efficient kernel
+        # When we only have one tensor, we pass it as both q and k, but only use the first output
+        x_ragged, _ = flashinfer.rope.apply_rope(  # type: ignore
+            x_ragged, x_ragged,
+            indptr=indptr,
+            offsets=offsets,
+            interleave=self.interleave,
+            rope_scale=self.rope_scale,
+            rope_theta=self.rope_theta,
+        )
+
+        # Reshape back to [BS, seq_len, num_heads, head_dim]
+        x_rope = x_ragged.reshape(BS, seq_len, num_heads, head_dim)
+
+        return x_rope
 
     def forward(
         self,
@@ -180,16 +297,18 @@ class FlashInferAttentionCore(IAttentionCore):
         v: torch.Tensor,
         causal: bool = False,
         use_rope: bool = False,
+        rope_offset: Optional[int] = None,
     ) -> torch.Tensor:
         """
-        Compute attention using FlashInfer.
+        Compute attention using FlashInfer with optional integrated RoPE.
 
         Args:
-            q: [BS, seq_len_q, num_heads, head_dim] - Query (RoPE already applied)
-            k: [BS, seq_len_k, num_heads, head_dim] - Key (RoPE already applied)
-            v: [BS, seq_len_k, num_heads, head_dim] - Value
+            q: [BS, seq_len_q, num_heads, head_dim] - Query tensor
+            k: [BS, seq_len_k, num_heads, head_dim] - Key tensor
+            v: [BS, seq_len_k, num_heads, head_dim] - Value tensor
             causal: Whether to apply causal masking
-            use_rope: Ignored (RoPE should be applied externally)
+            use_rope: If True, apply RoPE internally using flashinfer (more efficient)
+            rope_offset: Position offset for RoPE (only used when use_rope=True)
 
         Returns:
             Attention output [BS, seq_len_q, num_heads, head_dim]
@@ -224,6 +343,18 @@ class FlashInferAttentionCore(IAttentionCore):
             q_ragged = q.reshape(total_q_len, num_heads, head_dim)
             k_ragged = k.reshape(total_kv_len, num_heads, head_dim)
             v_ragged = v.reshape(total_kv_len, num_heads, head_dim)
+
+            # Apply RoPE if requested using flashinfer's built-in kernel
+            if use_rope and rope_offset is not None:
+                # Apply RoPE using flashinfer's efficient kernel
+                # This computes cos/sin on-the-fly inside the kernel
+                # Note: _apply_rope_internal expects [BS, L, H, D] and returns the same,
+                # so we need to reshape before and after
+                q_temp = q_ragged.reshape(BS, seq_len_q, num_heads, head_dim)
+                k_temp = k_ragged.reshape(BS, seq_len_kv, num_heads, head_dim)
+                q_temp, k_temp = self._apply_rope_internal(q_temp, k_temp, rope_offset)
+                q_ragged = q_temp.reshape(total_q_len, num_heads, head_dim)
+                k_ragged = k_temp.reshape(total_kv_len, num_heads, head_dim)
 
             # Create ragged tensor indices: qo_indptr and kv_indptr
             # Both [BS+1], marking start/end positions of each sequence
