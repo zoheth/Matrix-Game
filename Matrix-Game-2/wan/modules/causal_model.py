@@ -18,26 +18,133 @@ import torch
 import math
 import os
 import torch.distributed as dist
+from typing import Dict, OrderedDict
 
-# 允许通过环境变量选择使用模块化版本
+# 允许通过环境变量选择使用模块化版本和CUDA Graph
 USE_MODULAR_ACTION = os.environ.get("USE_MODULAR_ACTION", "1") == "1"
+USE_CUDA_GRAPH = os.environ.get("USE_ACTION_CUDA_GRAPH", "1") == "1"
 
 if USE_MODULAR_ACTION:
     try:
         from .modular_action import ActionModule
         print("[INFO] Using modular ActionModule implementation")
+
+        # 尝试导入 CUDA Graph wrapper
+        if USE_CUDA_GRAPH:
+            try:
+                from .modular_action.cuda_graph import ActionModuleGraphWrapper
+                print("[INFO] CUDA Graph wrapper available for ActionModule")
+            except ImportError as e:
+                print(f"[WARNING] Failed to import ActionModuleGraphWrapper: {e}")
+                print("[INFO] CUDA Graph will be disabled")
+                USE_CUDA_GRAPH = False
+                ActionModuleGraphWrapper = None
+        else:
+            ActionModuleGraphWrapper = None
+
     except ImportError as e:
         print(f"[WARNING] Failed to import modular ActionModule: {e}")
         print("[INFO] Falling back to original ActionModule")
         from .action_module import ActionModule
+        USE_CUDA_GRAPH = False
+        ActionModuleGraphWrapper = None
 else:
     from .action_module import ActionModule
+    USE_CUDA_GRAPH = False
+    ActionModuleGraphWrapper = None
 
 # wan 1.3B model has a weird channel / head configurations and require max-autotune to work with flexattention
 # see https://github.com/pytorch/pytorch/issues/133254
 # change to default for other models
 # flex_attention = torch.compile(
 #     flex_attention, dynamic=False, mode="max-autotune-no-cudagraphs")
+
+
+def _remap_action_module_state_dict(state_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    """
+    Remap state_dict keys for backward compatibility with old ActionModule structure.
+
+    Old ActionModule (flat structure):
+        model.blocks.0.action_model.mouse_mlp.*
+        model.blocks.0.action_model.keyboard_embed.*
+        model.blocks.0.action_model.t_qkv.*
+        model.blocks.0.action_model.img_attn_q_norm.*
+        model.blocks.0.action_model.img_attn_k_norm.*
+        model.blocks.0.action_model.proj_mouse.*
+        model.blocks.0.action_model.key_attn_q_norm.*
+        model.blocks.0.action_model.key_attn_k_norm.*
+        model.blocks.0.action_model.mouse_attn_q.*
+        model.blocks.0.action_model.keyboard_attn_kv.*
+        model.blocks.0.action_model.proj_keyboard.*
+
+    New Modular ActionModule wrapped with CUDA Graph:
+        model.blocks.0.action_model.action_module.mouse_injector.mouse_mlp.*
+        model.blocks.0.action_model.action_module.keyboard_injector.preprocessor.keyboard_embed.*
+        model.blocks.0.action_model.action_module.mouse_injector.t_qkv.*
+        model.blocks.0.action_model.action_module.mouse_injector.q_norm.* (was img_attn_q_norm)
+        model.blocks.0.action_model.action_module.mouse_injector.k_norm.* (was img_attn_k_norm)
+        model.blocks.0.action_model.action_module.mouse_injector.proj_mouse.*
+        model.blocks.0.action_model.action_module.keyboard_injector.q_norm.* (was key_attn_q_norm)
+        model.blocks.0.action_model.action_module.keyboard_injector.k_norm.* (was key_attn_k_norm)
+        model.blocks.0.action_model.action_module.keyboard_injector.mouse_attn_q.*
+        model.blocks.0.action_model.action_module.keyboard_injector.keyboard_attn_kv.*
+        model.blocks.0.action_model.action_module.keyboard_injector.proj_keyboard.*
+
+    Args:
+        state_dict: Original state dictionary from checkpoint
+
+    Returns:
+        Remapped state dictionary compatible with new modular ActionModule
+    """
+    if not USE_CUDA_GRAPH or ActionModuleGraphWrapper is None:
+        # No remapping needed if not using CUDA Graph wrapper
+        return state_dict
+
+    # Define the mapping rules from old keys to new keys
+    key_mappings = {
+        # Mouse-related mappings
+        'mouse_mlp.': 'action_module.mouse_injector.mouse_mlp.',
+        't_qkv.': 'action_module.mouse_injector.t_qkv.',
+        'img_attn_q_norm.': 'action_module.mouse_injector.q_norm.',
+        'img_attn_k_norm.': 'action_module.mouse_injector.k_norm.',
+        'proj_mouse.': 'action_module.mouse_injector.proj_mouse.',
+
+        # Keyboard-related mappings
+        'keyboard_embed.': 'action_module.keyboard_injector.preprocessor.keyboard_embed.',
+        'key_attn_q_norm.': 'action_module.keyboard_injector.q_norm.',
+        'key_attn_k_norm.': 'action_module.keyboard_injector.k_norm.',
+        'mouse_attn_q.': 'action_module.keyboard_injector.mouse_attn_q.',
+        'keyboard_attn_kv.': 'action_module.keyboard_injector.keyboard_attn_kv.',
+        'proj_keyboard.': 'action_module.keyboard_injector.proj_keyboard.',
+    }
+
+    remapped = {}
+    for key, value in state_dict.items():
+        # Check if this is an action_model key that needs remapping
+        if '.action_model.' in key and '.action_module.' not in key:
+            # Split the key to check suffix
+            parts = key.split('.action_model.')
+            if len(parts) == 2:
+                prefix, suffix = parts
+
+                # Try to match and remap using the mapping rules
+                remapped_key = None
+                for old_pattern, new_pattern in key_mappings.items():
+                    if suffix.startswith(old_pattern):
+                        # Remap to new structure
+                        remapped_key = f"{prefix}.action_model.{new_pattern}{suffix[len(old_pattern):]}"
+                        break
+
+                if remapped_key:
+                    remapped[remapped_key] = value
+                    if not dist.is_initialized() or dist.get_rank() == 0:
+                        print(f"[State Dict Remap] {key} -> {remapped_key}")
+                    continue
+
+        # Keep the key as-is if no remapping needed
+        remapped[key] = value
+
+    return remapped
 
 
 def causal_rope_apply(x, grid_sizes, freqs, start_frame=0):
@@ -235,7 +342,23 @@ class CausalWanAttentionBlock(nn.Module):
         self.cross_attn_norm = cross_attn_norm
         self.eps = eps
         if len(action_config) != 0 and block_idx in action_config['blocks']:
-            self.action_model = ActionModule(**action_config, local_attn_size=self.local_attn_size)
+            # Create a copy of action_config and set local_attn_size
+            config_dict = dict(action_config)
+            config_dict['local_attn_size'] = self.local_attn_size
+
+            action_module = ActionModule(**config_dict)
+
+            # Wrap with CUDA Graph if enabled
+            if USE_CUDA_GRAPH and ActionModuleGraphWrapper is not None:
+                self.action_model = ActionModuleGraphWrapper(
+                    action_module,
+                    max_cached_graphs=10,
+                    enable_cuda_graph=True,
+                    num_warmup_iters=3,
+                )
+                print(f"[INFO] Block {block_idx}: ActionModule wrapped with CUDA Graph")
+            else:
+                self.action_model = action_module
         else:
             self.action_model = None
         # layers
@@ -911,6 +1034,19 @@ class CausalWanModel(ModelMixin, ConfigMixin, FromOriginalModelMixin, PeftAdapte
         return x
         
 
+    def load_state_dict(self, state_dict, strict=True):
+        """
+        Override load_state_dict to handle backward compatibility with unwrapped ActionModule checkpoints.
+
+        When loading checkpoints saved without ActionModuleGraphWrapper, automatically remap
+        the keys to match the wrapped structure.
+        """
+        # Remap keys if necessary
+        remapped_state_dict = _remap_action_module_state_dict(state_dict)
+
+        # Call parent's load_state_dict with remapped dictionary
+        return super().load_state_dict(remapped_state_dict, strict=strict)
+
     def init_weights(self):
         r"""
         Initialize model parameters using Xavier initialization.
@@ -925,7 +1061,7 @@ class CausalWanModel(ModelMixin, ConfigMixin, FromOriginalModelMixin, PeftAdapte
 
         # init embeddings
         nn.init.xavier_uniform_(self.patch_embedding.weight.flatten(1))
-        
+
         for m in self.time_embedding.modules():
             if isinstance(m, nn.Linear):
                 nn.init.normal_(m.weight, std=.02)
@@ -935,11 +1071,26 @@ class CausalWanModel(ModelMixin, ConfigMixin, FromOriginalModelMixin, PeftAdapte
         if self.use_action_module == True:
             for m in self.blocks:
                 try:
-                    nn.init.zeros_(m.action_model.proj_mouse.weight)
-                    if m.action_model.proj_mouse.bias is not None:
-                        nn.init.zeros_(m.action_model.proj_mouse.bias)
-                    nn.init.zeros_(m.action_model.proj_keyboard.weight)
-                    if m.action_model.proj_keyboard.bias is not None:
-                        nn.init.zeros_(m.action_model.proj_keyboard.bias)
+                    # Handle both direct ActionModule and wrapped version
+                    action_model = m.action_model
+                    if action_model is None:
+                        continue
+
+                    # Check if it's wrapped with CUDA Graph
+                    if ActionModuleGraphWrapper is not None and isinstance(action_model, ActionModuleGraphWrapper):
+                        # Access the underlying ActionModule
+                        action_model = action_model.action_module
+
+                    # Now initialize the underlying ActionModule's weights
+                    if hasattr(action_model, 'mouse_injector') and action_model.mouse_injector is not None:
+                        nn.init.zeros_(action_model.mouse_injector.proj_mouse.weight)
+                        if action_model.mouse_injector.proj_mouse.bias is not None:
+                            nn.init.zeros_(action_model.mouse_injector.proj_mouse.bias)
+
+                    if hasattr(action_model, 'keyboard_injector') and action_model.keyboard_injector is not None:
+                        nn.init.zeros_(action_model.keyboard_injector.proj_keyboard.weight)
+                        if action_model.keyboard_injector.proj_keyboard.bias is not None:
+                            nn.init.zeros_(action_model.keyboard_injector.proj_keyboard.bias)
                 except:
+                    # Silently skip if attributes don't exist
                     pass

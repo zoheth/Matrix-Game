@@ -155,6 +155,9 @@ class FlashInferAttentionCore(IAttentionCore):
         self.rope_theta = rope_theta
         self.interleave = interleave
 
+        # CUDA Graph compatibility: cache last plan parameters
+        self._last_plan_params = None
+
     def _apply_rope_internal(
         self,
         q: torch.Tensor,
@@ -350,16 +353,20 @@ class FlashInferAttentionCore(IAttentionCore):
                 )
 
             # Plan the attention computation (creates auxiliary data structures)
-            self._batch_wrapper.plan(
-                qo_indptr,
-                kv_indptr,
-                num_heads,
-                num_heads,  # Assume num_kv_heads == num_qo_heads for now
-                head_dim,
-                causal=causal,
-                q_data_type=q.dtype,  # Use actual dtype of q
-                kv_data_type=k.dtype,  # Use actual dtype of k/v
-            )
+            # IMPORTANT: Only plan if parameters changed (CUDA Graph compatibility)
+            current_plan_params = (BS, seq_len_q, seq_len_kv, num_heads, head_dim, causal, q.dtype, k.dtype)
+            if self._last_plan_params != current_plan_params:
+                self._batch_wrapper.plan(
+                    qo_indptr,
+                    kv_indptr,
+                    num_heads,
+                    num_heads,  # Assume num_kv_heads == num_qo_heads for now
+                    head_dim,
+                    causal=causal,
+                    q_data_type=q.dtype,  # Use actual dtype of q
+                    kv_data_type=k.dtype,  # Use actual dtype of k/v
+                )
+                self._last_plan_params = current_plan_params
 
             # Run the attention computation
             output = self._batch_wrapper.run(q_ragged, k_ragged, v_ragged)

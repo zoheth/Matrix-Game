@@ -11,6 +11,14 @@ import torch.nn.functional as F
 from demo_utils.constant import ZERO_VAE_CACHE
 from tqdm import tqdm
 
+# Import for CUDA Graph zero-copy kv_cache
+try:
+    from wan.modules.modular_action.cuda_graph import ActionModuleGraphWrapper
+    CUDA_GRAPH_AVAILABLE = True
+except ImportError:
+    ActionModuleGraphWrapper = None
+    CUDA_GRAPH_AVAILABLE = False
+
 def get_current_action(mode="universal"):
 
     CAM_VALUE = 0.1
@@ -398,6 +406,9 @@ class CausalInferencePipeline(torch.nn.Module):
     def _initialize_kv_cache_mouse_and_keyboard(self, batch_size, dtype, device):
         """
         Initialize a Per-GPU KV cache for the Wan model.
+
+        With CUDA Graph support: attempts to use ActionModuleGraphWrapper's static kv_cache
+        for zero-copy operation. Falls back to regular allocation if not available.
         """
         kv_cache_mouse = []
         kv_cache_keyboard = []
@@ -405,19 +416,62 @@ class CausalInferencePipeline(torch.nn.Module):
             kv_cache_size = self.local_attn_size
         else:
             kv_cache_size = 15 * 1
-        for _ in range(self.num_transformer_blocks):
-            kv_cache_keyboard.append({
-                "k": torch.zeros([batch_size, kv_cache_size, 16, 64], dtype=dtype, device=device),
-                "v": torch.zeros([batch_size, kv_cache_size, 16, 64], dtype=dtype, device=device),
-                "global_end_index": torch.tensor([0], dtype=torch.long, device=device),
-                "local_end_index": torch.tensor([0], dtype=torch.long, device=device)
-            })
-            kv_cache_mouse.append({
-                "k": torch.zeros([batch_size * self.frame_seq_length, kv_cache_size, 16, 64], dtype=dtype, device=device),
-                "v": torch.zeros([batch_size * self.frame_seq_length, kv_cache_size, 16, 64], dtype=dtype, device=device),
-                "global_end_index": torch.tensor([0], dtype=torch.long, device=device),
-                "local_end_index": torch.tensor([0], dtype=torch.long, device=device)
-            })
+        # Try to use CUDA Graph static kv_cache (zero copy)
+        use_cuda_graph_kv = CUDA_GRAPH_AVAILABLE and hasattr(self.generator, 'model') and hasattr(self.generator.model, 'blocks')
+
+        if use_cuda_graph_kv:
+            print("[Pipeline] Attempting to use CUDA Graph static kv_cache (zero copy)")
+
+        for block_idx in range(self.num_transformer_blocks):
+            static_kv_obtained = False
+
+            if use_cuda_graph_kv:
+                try:
+                    block = self.generator.model.blocks[block_idx]
+                    action_model = getattr(block, 'action_model', None)
+
+                    if action_model is not None and isinstance(action_model, ActionModuleGraphWrapper):
+                        # Create dummy inputs for graph capture
+                        # Typical shape: [B, T*S, C] where T=1, S=880, C=hidden_dim
+                        dummy_x = torch.zeros(batch_size, 1 * self.frame_seq_length, 1536,
+                                             device=device, dtype=dtype)
+
+                        # Trigger graph capture and get static kv_cache
+                        static_kv = action_model.get_or_create_static_kv_cache(
+                            x=dummy_x,
+                            tt=1,  # temporal_shape
+                            th=22,  # spatial_h (typical for 880 = 22*40)
+                            tw=40,  # spatial_w
+                            is_causal=True,
+                            num_frame_per_block=self.num_frame_per_block,
+                            start_frame=0,
+                        )
+
+                        if static_kv is not None and static_kv['mouse'] is not None and static_kv['keyboard'] is not None:
+                            # Successfully obtained static kv_cache
+                            kv_cache_mouse.append(static_kv['mouse'])
+                            kv_cache_keyboard.append(static_kv['keyboard'])
+                            static_kv_obtained = True
+                            print(f"[Pipeline] Block {block_idx}: Using CUDA Graph static kv_cache (zero copy) ✅")
+                except Exception as e:
+                    print(f"[Pipeline] Block {block_idx}: Failed to get static kv_cache: {e}")
+
+            if not static_kv_obtained:
+                # Fallback: allocate kv_cache ourselves (original logic)
+                kv_cache_keyboard.append({
+                    "k": torch.zeros([batch_size, kv_cache_size, 16, 64], dtype=dtype, device=device),
+                    "v": torch.zeros([batch_size, kv_cache_size, 16, 64], dtype=dtype, device=device),
+                    "global_end_index": torch.tensor([0], dtype=torch.long, device=device),
+                    "local_end_index": torch.tensor([0], dtype=torch.long, device=device)
+                })
+                kv_cache_mouse.append({
+                    "k": torch.zeros([batch_size * self.frame_seq_length, kv_cache_size, 16, 64], dtype=dtype, device=device),
+                    "v": torch.zeros([batch_size * self.frame_seq_length, kv_cache_size, 16, 64], dtype=dtype, device=device),
+                    "global_end_index": torch.tensor([0], dtype=torch.long, device=device),
+                    "local_end_index": torch.tensor([0], dtype=torch.long, device=device)
+                })
+                if use_cuda_graph_kv:
+                    print(f"[Pipeline] Block {block_idx}: Using self-allocated kv_cache (eager mode)")
         self.kv_cache_keyboard = kv_cache_keyboard  # always store the clean cache
         self.kv_cache_mouse = kv_cache_mouse  # always store the clean cache
 
@@ -720,6 +774,9 @@ class CausalInferenceStreamingPipeline(torch.nn.Module):
     def _initialize_kv_cache_mouse_and_keyboard(self, batch_size, dtype, device):
         """
         Initialize a Per-GPU KV cache for the Wan model.
+
+        With CUDA Graph support: attempts to use ActionModuleGraphWrapper's static kv_cache
+        for zero-copy operation. Falls back to regular allocation if not available.
         """
         kv_cache_mouse = []
         kv_cache_keyboard = []
@@ -727,19 +784,63 @@ class CausalInferenceStreamingPipeline(torch.nn.Module):
             kv_cache_size = self.local_attn_size
         else:
             kv_cache_size = 15 * 1
-        for _ in range(self.num_transformer_blocks):
-            kv_cache_keyboard.append({
-                "k": torch.zeros([batch_size, kv_cache_size, 16, 64], dtype=dtype, device=device),
-                "v": torch.zeros([batch_size, kv_cache_size, 16, 64], dtype=dtype, device=device),
-                "global_end_index": torch.tensor([0], dtype=torch.long, device=device),
-                "local_end_index": torch.tensor([0], dtype=torch.long, device=device)
-            })
-            kv_cache_mouse.append({
-                "k": torch.zeros([batch_size * self.frame_seq_length, kv_cache_size, 16, 64], dtype=dtype, device=device),
-                "v": torch.zeros([batch_size * self.frame_seq_length, kv_cache_size, 16, 64], dtype=dtype, device=device),
-                "global_end_index": torch.tensor([0], dtype=torch.long, device=device),
-                "local_end_index": torch.tensor([0], dtype=torch.long, device=device)
-            })
+        # Try to use CUDA Graph static kv_cache (zero copy)
+        use_cuda_graph_kv = CUDA_GRAPH_AVAILABLE and hasattr(self.generator, 'model') and hasattr(self.generator.model, 'blocks')
+
+        if use_cuda_graph_kv:
+            print("[Pipeline] Attempting to use CUDA Graph static kv_cache (zero copy)")
+
+        for block_idx in range(self.num_transformer_blocks):
+            static_kv_obtained = False
+
+            if use_cuda_graph_kv:
+                try:
+                    block = self.generator.model.blocks[block_idx]
+                    action_model = getattr(block, 'action_model', None)
+
+                    if action_model is not None and isinstance(action_model, ActionModuleGraphWrapper):
+                        # Create dummy inputs for graph capture
+                        # Typical shape: [B, T*S, C] where T=1, S=880, C=hidden_dim
+                        dummy_x = torch.zeros(batch_size, 1 * self.frame_seq_length, 1536,
+                                             device=device, dtype=dtype)
+
+                        # Trigger graph capture and get static kv_cache
+                        static_kv = action_model.get_or_create_static_kv_cache(
+                            x=dummy_x,
+                            tt=1,  # temporal_shape
+                            th=22,  # spatial_h (typical for 880 = 22*40)
+                            tw=40,  # spatial_w
+                            is_causal=True,
+                            num_frame_per_block=self.num_frame_per_block,
+                            start_frame=0,
+                        )
+
+                        if static_kv is not None and static_kv['mouse'] is not None and static_kv['keyboard'] is not None:
+                            # Successfully obtained static kv_cache
+                            kv_cache_mouse.append(static_kv['mouse'])
+                            kv_cache_keyboard.append(static_kv['keyboard'])
+                            static_kv_obtained = True
+                            print(f"[Pipeline] Block {block_idx}: Using CUDA Graph static kv_cache (zero copy) ✅")
+                except Exception as e:
+                    print(f"[Pipeline] Block {block_idx}: Failed to get static kv_cache: {e}")
+
+            if not static_kv_obtained:
+                # Fallback: allocate kv_cache ourselves (original logic)
+                kv_cache_keyboard.append({
+                    "k": torch.zeros([batch_size, kv_cache_size, 16, 64], dtype=dtype, device=device),
+                    "v": torch.zeros([batch_size, kv_cache_size, 16, 64], dtype=dtype, device=device),
+                    "global_end_index": torch.tensor([0], dtype=torch.long, device=device),
+                    "local_end_index": torch.tensor([0], dtype=torch.long, device=device)
+                })
+                kv_cache_mouse.append({
+                    "k": torch.zeros([batch_size * self.frame_seq_length, kv_cache_size, 16, 64], dtype=dtype, device=device),
+                    "v": torch.zeros([batch_size * self.frame_seq_length, kv_cache_size, 16, 64], dtype=dtype, device=device),
+                    "global_end_index": torch.tensor([0], dtype=torch.long, device=device),
+                    "local_end_index": torch.tensor([0], dtype=torch.long, device=device)
+                })
+                if use_cuda_graph_kv:
+                    print(f"[Pipeline] Block {block_idx}: Using self-allocated kv_cache (eager mode)")
+
         self.kv_cache_keyboard = kv_cache_keyboard  # always store the clean cache
         self.kv_cache_mouse = kv_cache_mouse  # always store the clean cache
 

@@ -97,6 +97,11 @@ class InteractiveGameInference:
         if self.args.checkpoint_path:
             print("Loading Pretrained Model...")
             state_dict = load_file(self.args.checkpoint_path)
+
+            # Import the remapping function for backward compatibility with CUDA Graph wrapper
+            from wan.modules.causal_model import _remap_action_module_state_dict
+            state_dict = _remap_action_module_state_dict(state_dict)
+
             pipeline.generator.load_state_dict(state_dict)
 
         self.pipeline = pipeline.to(device=self.device, dtype=self.weight_dtype)
