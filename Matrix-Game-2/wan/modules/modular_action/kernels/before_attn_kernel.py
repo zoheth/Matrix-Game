@@ -42,44 +42,45 @@ def _compute_indices_kernel(
 
     # --- 2. 在 GPU 上计算所有驱逐（Eviction）参数 ---
     needs_eviction = (num_new_tokens + local_end_idx) > cache_size
-    num_evicted_tokens = 0
-    num_rolled_tokens = 0
-    new_local_end_index = 0
-    
-    src_start = 0
-    dst_start = 0
 
-    if needs_eviction:
-        num_evicted_tokens = num_new_tokens + local_end_idx - cache_size
-        num_rolled_tokens = local_end_idx - num_evicted_tokens - sink_tokens
-        
-        if num_rolled_tokens > 0:
-            src_start = sink_tokens + num_evicted_tokens
-            dst_start = sink_tokens
-            
-        new_local_end_index = local_end_idx + num_new_tokens - num_evicted_tokens
-    else:
-        new_local_end_index = local_end_idx + num_new_tokens
+    # Compute eviction parameters (always compute, select with where)
+    # All computations must result in int32 to match params_buffer type
+    num_evicted_tokens_if_evict = (num_new_tokens + local_end_idx - cache_size)
+    num_rolled_tokens_if_evict = (local_end_idx - num_evicted_tokens_if_evict - sink_tokens)
+
+    num_evicted_tokens = tl.where(needs_eviction, num_evicted_tokens_if_evict, 0)
+    num_rolled_tokens = tl.where(needs_eviction, num_rolled_tokens_if_evict, 0)
+
+    # src_start and dst_start depend on both needs_eviction AND num_rolled_tokens > 0
+    has_roll = needs_eviction & (num_rolled_tokens > 0)
+    src_start = tl.where(has_roll, sink_tokens + num_evicted_tokens, 0)
+    dst_start = tl.where(has_roll, sink_tokens, 0)
+
+    # new_local_end_index
+    new_local_end_index = tl.where(needs_eviction,
+                                   local_end_idx + num_new_tokens - num_evicted_tokens,
+                                   local_end_idx + num_new_tokens)
 
     local_start_index = new_local_end_index - num_new_tokens
 
     # --- 3. 计算窗口（Window）参数 ---
-    window_start = new_local_end_index - max_attention_size
-    if window_start < 0:
-        window_start = 0
+    window_start_raw = new_local_end_index - max_attention_size
+    window_start = tl.where(window_start_raw < 0, 0, window_start_raw)
 
     # --- 4. 将所有结果写入 Params_Buffer ---
+    # Cast all values to int32 for storage in params_buffer
     tl.store(Params_Buffer_ptr + 0, needs_eviction.to(tl.int32))
-    tl.store(Params_Buffer_ptr + 1, num_rolled_tokens)
-    tl.store(Params_Buffer_ptr + 2, src_start)
-    tl.store(Params_Buffer_ptr + 3, dst_start)
-    tl.store(Params_Buffer_ptr + 4, local_start_index)
-    tl.store(Params_Buffer_ptr + 5, new_local_end_index)
-    tl.store(Params_Buffer_ptr + 6, window_start)
-    tl.store(Params_Buffer_ptr + 7, current_end.to(tl.int32)) # 存 int32 即可
+    tl.store(Params_Buffer_ptr + 1, num_rolled_tokens.to(tl.int32))
+    tl.store(Params_Buffer_ptr + 2, src_start.to(tl.int32))
+    tl.store(Params_Buffer_ptr + 3, dst_start.to(tl.int32))
+    tl.store(Params_Buffer_ptr + 4, local_start_index.to(tl.int32))
+    tl.store(Params_Buffer_ptr + 5, new_local_end_index.to(tl.int32))
+    tl.store(Params_Buffer_ptr + 6, window_start.to(tl.int32))
+    tl.store(Params_Buffer_ptr + 7, current_end.to(tl.int32))
 
     # --- 5. 更新 Local Index ---
     # 注意：Global index 已经在开头用 atomic_add 更新过了
+    # Store as int64 in the local_end_index tensor
     tl.store(Local_End_Idx_ptr, new_local_end_index.to(tl.int64))
 
 
@@ -120,22 +121,25 @@ def _fused_update_mean_kernel(
         return
         
     # --- 2. 从 Buffer 加载索引 (所有线程都加载) ---
-    needs_eviction = tl.load(Params_Buffer_ptr + 0)
+    needs_eviction_int = tl.load(Params_Buffer_ptr + 0)
     num_rolled_tokens = tl.load(Params_Buffer_ptr + 1)
     src_start = tl.load(Params_Buffer_ptr + 2)
     dst_start = tl.load(Params_Buffer_ptr + 3)
     local_start_index = tl.load(Params_Buffer_ptr + 4)
+
+    # Convert needs_eviction from int32 to boolean for conditional
+    needs_eviction = needs_eviction_int != 0
 
     # --- 3. 初始化 Head Dim 偏移量 ---
     d_offsets = tl.arange(0, BLOCK_D)
     d_mask = d_offsets < head_dim
 
     # --- 4. Fused Eviction + Insertion ---
-    
+
     # 任务分配：
     # pid_t_global < num_rolled_tokens 的线程处理 Eviction
     # pid_t_global >= num_rolled_tokens 的线程处理 Insertion
-    
+
     if needs_eviction and pid_t_global < num_rolled_tokens:
         # --- 任务 A: 执行 Eviction (Roll) ---
         t = pid_t_global # t in [0, num_rolled_tokens)
@@ -267,6 +271,10 @@ def update_kv_cache_triton(
     
     global_end_idx_tensor = kv_cache["global_end_index"]
     local_end_idx_tensor = kv_cache["local_end_index"]
+
+    # Create params_buffer if it doesn't exist (for backward compatibility)
+    if "_params_buffer" not in kv_cache:
+        kv_cache["_params_buffer"] = torch.zeros(8, device='cuda', dtype=torch.int32)
     params_buffer = kv_cache["_params_buffer"]
 
     # --- 2. 启动 Kernel 1: 计算索引 (异步) ---
@@ -310,8 +318,10 @@ def update_kv_cache_triton(
     
     grid = (num_heads, grid_t)
 
+    cache_v = kv_cache["v"]  # Get V cache
+
     _fused_update_mean_kernel[grid](
-        cache_k, cache_k, # K_cache, V_cache (示例中 K 和 V 指针相同，您应传入 V_cache_ptr)
+        cache_k, cache_v,  # K_cache, V_cache
         k_new_source, v_new_source,
         params_buffer,
         S_dim=S_dim,

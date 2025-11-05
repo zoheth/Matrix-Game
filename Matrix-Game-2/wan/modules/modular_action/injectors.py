@@ -14,6 +14,7 @@ from wan.modules.modular_action.interfaces import (
 from wan.modules.modular_action.action_config import ActionConfig
 
 from .kernels.preprocessor_kernel import mouse_preprocessor_triton
+from .kernels.before_attn_kernel import update_kv_cache_triton
 
 class MousePreprocessor(IActionPreprocessor):
     """
@@ -441,19 +442,28 @@ class KeyboardInjector(IAttentionInjector):
         k_rope = self.attn_core._apply_rope_single(k, start_frame)
 
         if is_causal and kv_cache is not None:
-            # Expand K, V to match spatial dimension: [B, T_k, H, D] -> [B*S, T_k, H, D]
-            k_rope_expanded = k_rope.unsqueeze(1).expand(-1, S, -1, -1, -1).reshape(B * S, -1, k_rope.shape[-2], k_rope.shape[-1])
-            v_expanded = v.unsqueeze(1).expand(-1, S, -1, -1, -1).reshape(B * S, -1, v.shape[-2], v.shape[-1])
+            # For Triton kernel, we need K, V in shape [S, num_new_tokens, num_heads, head_dim]
+            # Current: k_rope is [B, T_k, H, D], v is [B, T_k, H, D]
+            # We need to expand to spatial dimension and transpose to get the right shape
 
-            # Update KV cache (only store for first spatial location to save memory)
-            k_cache_update = k_rope_expanded[:S].mean(dim=0, keepdim=True)
-            v_cache_update = v_expanded[:S].mean(dim=0, keepdim=True)
+            # Expand to spatial dimension: [B, T_k, H, D] -> [B, S, T_k, H, D]
+            k_rope_expanded = k_rope.unsqueeze(1).expand(-1, S, -1, -1, -1)
+            v_expanded = v.unsqueeze(1).expand(-1, S, -1, -1, -1)
 
-            k_window, v_window, _, _ = self.kv_cache_manager.update_cache(
-                kv_cache, k_cache_update, v_cache_update, num_frame_per_block
+            # Transpose to [S, T_k, H, D] format for Triton kernel (take first batch)
+            k_rope_for_cache = k_rope_expanded[0]  # [S, T_k, H, D]
+            v_for_cache = v_expanded[0]  # [S, T_k, H, D]
+
+            # Use Triton fused kernel for KV cache update with mean operation
+            k_window, v_window, _, _ = update_kv_cache_triton(
+                kv_cache,
+                k_rope_for_cache,  # [S, T_k, H, D]
+                v_for_cache,       # [S, T_k, H, D]
+                max_attention_size=self.kv_cache_manager.max_attention_size,
+                sink_tokens=self.kv_cache_manager.sink_tokens,
             )
 
-            # Expand window to all spatial locations
+            # Expand window to all spatial locations: [1, window_len, H, D] -> [B*S, window_len, H, D]
             k_window = k_window.expand(B * S, -1, -1, -1)
             v_window = v_window.expand(B * S, -1, -1, -1)
 
