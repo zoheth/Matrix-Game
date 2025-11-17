@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn
 
 from wan.modules.vae import AttentionBlock, CausalConv3d, RMS_norm, ResidualBlock, Upsample
-
+from .new_vae import VaeDecoder3d
 
 class Resample(nn.Module):
 

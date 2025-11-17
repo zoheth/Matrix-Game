@@ -7,9 +7,10 @@ from omegaconf import OmegaConf
 from torchvision.transforms import v2
 from diffusers.utils import load_image
 from einops import rearrange
-from pipeline import CausalInferencePipeline
+from pipeline import BatchCausalInferencePipeline, PipelineConfig
 from wan.vae.wanx_vae import get_wanx_vae_wrapper
-from demo_utils.vae_block3 import VAEDecoderWrapper
+from demo_utils.vae_block3 import VAEDecoderWrapper as OldVAEDecoderWrapper
+from demo_utils.new_vae_wrapper import NewVAEDecoderWrapper
 from utils.visualize import process_video
 from utils.misc import set_seed
 from utils.conditions import *
@@ -29,6 +30,8 @@ def parse_args():
     parser.add_argument("--enable_profile", action="store_true", help="Enable torch profiling")
     parser.add_argument("--vae_compile_mode", type=str, default="auto", choices=["auto", "force", "none"],
                         help="VAE decoder compile mode: auto (use cache if available), force (recompile), none (no compile)")
+    parser.add_argument("--use_new_vae", action="store_true",
+                        help="Use new VaeDecoder3d implementation instead of old VAEDecoder3d")
     args = parser.parse_args()
     return args
 
@@ -52,21 +55,66 @@ class InteractiveGameInference:
         self.config = OmegaConf.load(self.args.config_path)
 
     def _init_models(self):
-        # Initialize pipeline
+        # Initialize diffusion model
         generator = WanDiffusionWrapper(
             **getattr(self.config, "model_kwargs", {}), is_causal=True)
 
+        # Load checkpoint if provided
+        if self.args.checkpoint_path:
+            print("Loading Pretrained Model...")
+            state_dict = load_file(self.args.checkpoint_path)
+            generator.load_state_dict(state_dict)
+
         # Load and optionally compile VAE decoder
-        compiled_model_path = os.path.join(self.args.pretrained_model_path, "compiled_vae_decoder.pt")
+        current_vae_decoder = self._load_vae_decoder()
+
+        # Create pipeline configuration from OmegaConf
+        # Extract mode from config (will be popped later, so get it now)
+        mode = self.config.get('mode', 'universal')
+        pipeline_config = PipelineConfig.from_legacy_args(self.config)
+        pipeline_config.mode = mode
+
+        # Initialize refactored pipeline
+        self.pipeline = BatchCausalInferencePipeline(
+            config=pipeline_config,
+            generator=generator,
+            vae_decoder=current_vae_decoder,
+            device="cuda"
+        ).to(device=self.device, dtype=self.weight_dtype)
+
+        self.pipeline.vae_decoder.to(torch.float16)
+
+        # Initialize VAE encoder
+        vae = get_wanx_vae_wrapper(self.args.pretrained_model_path, torch.float16)
+        vae.requires_grad_(False)
+        vae.eval()
+        self.vae = vae.to(self.device, self.weight_dtype)
+
+    def _load_vae_decoder(self):
+        """Load and optionally compile VAE decoder."""
+        vae_type = "new" if self.args.use_new_vae else "old"
+        compiled_model_path = os.path.join(
+            self.args.pretrained_model_path,
+            f"compiled_vae_decoder_{vae_type}.pt"
+        )
         compile_mode = self.args.vae_compile_mode
 
         # Load base model
-        current_vae_decoder = VAEDecoderWrapper()
-        vae_state_dict = torch.load(os.path.join(self.args.pretrained_model_path, "Wan2.1_VAE.pth"), map_location="cpu")
-        decoder_state_dict = {}
-        for key, value in vae_state_dict.items():
-            if 'decoder.' in key or 'conv2' in key:
-                decoder_state_dict[key] = value
+        if self.args.use_new_vae:
+            print("Using new VaeDecoder3d implementation")
+            current_vae_decoder = NewVAEDecoderWrapper()
+        else:
+            print("Using old VAEDecoder3d implementation")
+            current_vae_decoder = OldVAEDecoderWrapper()
+
+        vae_state_dict = torch.load(
+            os.path.join(self.args.pretrained_model_path, "Wan2.1_VAE.pth"),
+            map_location="cpu"
+        )
+        decoder_state_dict = {
+            key: value for key, value in vae_state_dict.items()
+            if 'decoder.' in key or 'conv2' in key
+        }
         current_vae_decoder.load_state_dict(decoder_state_dict)
         current_vae_decoder.to(self.device, torch.float16)
         current_vae_decoder.requires_grad_(False)
@@ -84,7 +132,11 @@ class InteractiveGameInference:
         elif compile_mode == "auto":
             if os.path.exists(compiled_model_path):
                 print(f"Loading cached compiled model from {compiled_model_path}...")
-                current_vae_decoder = torch.load(compiled_model_path, map_location=self.device, weights_only=False)
+                current_vae_decoder = torch.load(
+                    compiled_model_path,
+                    map_location=self.device,
+                    weights_only=False
+                )
                 print("Cached compiled model loaded!")
             else:
                 print(f"No cached compiled model found. Compiling VAE decoder (first run)...")
@@ -93,19 +145,7 @@ class InteractiveGameInference:
                 torch.save(current_vae_decoder, compiled_model_path)
                 print("Compiled model saved for future use!")
 
-        pipeline = CausalInferencePipeline(self.config, generator=generator, vae_decoder=current_vae_decoder)
-        if self.args.checkpoint_path:
-            print("Loading Pretrained Model...")
-            state_dict = load_file(self.args.checkpoint_path)
-            pipeline.generator.load_state_dict(state_dict)
-
-        self.pipeline = pipeline.to(device=self.device, dtype=self.weight_dtype)
-        self.pipeline.vae_decoder.to(torch.float16)
-
-        vae = get_wanx_vae_wrapper(self.args.pretrained_model_path, torch.float16)
-        vae.requires_grad_(False)
-        vae.eval()
-        self.vae = vae.to(self.device, self.weight_dtype)
+        return current_vae_decoder
 
     def _resizecrop(self, image, th, tw):
         w, h = image.size
@@ -123,7 +163,8 @@ class InteractiveGameInference:
         return image
     
     def generate_videos(self):
-        mode = self.config.pop('mode')
+        # Get mode from pipeline config
+        mode = self.pipeline.config.mode
         assert mode in ['universal', 'gta_drive', 'templerun']
 
         with torch.profiler.record_function("1_Data_Preparation"):
@@ -174,11 +215,11 @@ class InteractiveGameInference:
 
         with torch.no_grad():
             with torch.profiler.record_function("2_Pipeline_Inference"):
+                # Use refactored pipeline (mode is already in config)
                 videos = self.pipeline.inference(
                     noise=sampled_noise,
                     conditional_dict=conditional_dict,
                     return_latents=False,
-                    mode=mode,
                     profile=self.enable_profile
                 )
 

@@ -1,194 +1,432 @@
-from abc import abstractmethod, ABC
+"""
+Refactored scheduler module with clean architecture.
+
+Key design principles:
+1. Clear inheritance hierarchy
+2. Single responsibility per class
+3. Scheduler owns ALL timestep logic
+4. No dynamic method binding hacks
+"""
+
+from abc import ABC, abstractmethod
+from typing import Optional, List
 import torch
 
 
-class SchedulerInterface(ABC):
+class DiffusionScheduler(ABC):
     """
-    Base class for diffusion noise schedule.
-    """
-    alphas_cumprod: torch.Tensor  # [T], alphas for defining the noise schedule
+    Base class for all diffusion schedulers.
 
-    @abstractmethod
-    def add_noise(
-        self, clean_latent: torch.Tensor,
-        noise: torch.Tensor, timestep: torch.Tensor
+    A scheduler is responsible for:
+    1. Managing the noise schedule (sigmas, timesteps)
+    2. Adding noise to clean samples (forward diffusion)
+    3. Denoising samples (reverse diffusion step)
+    4. Converting between different prediction types (x0, noise, velocity)
+    """
+
+    def __init__(
+        self,
+        num_train_timesteps: int = 1000,
+        num_inference_steps: int = 100
     ):
         """
-        Diffusion forward corruption process.
-        Input:
-            - clean_latent: the clean latent with shape [B, C, H, W]
-            - noise: the noise with shape [B, C, H, W]
-            - timestep: the timestep with shape [B]
-        Output: the corrupted latent with shape [B, C, H, W]
+        Initialize the scheduler.
+
+        Args:
+            num_train_timesteps: Total timesteps used during training
+            num_inference_steps: Number of steps to use during inference
+        """
+        self.num_train_timesteps = num_train_timesteps
+        self.num_inference_steps = num_inference_steps
+
+        # These will be set by set_timesteps()
+        self.timesteps: Optional[torch.Tensor] = None
+        self.sigmas: Optional[torch.Tensor] = None
+
+    @abstractmethod
+    def set_timesteps(
+        self,
+        num_inference_steps: Optional[int] = None,
+        denoising_strength: float = 1.0
+    ) -> None:
+        """
+        Set the discrete timesteps for inference.
+
+        Args:
+            num_inference_steps: Number of inference steps (uses default if None)
+            denoising_strength: Strength of denoising (0.0 to 1.0)
         """
         pass
 
-    def convert_x0_to_noise(
-        self, x0: torch.Tensor, xt: torch.Tensor,
+    @abstractmethod
+    def add_noise(
+        self,
+        original_samples: torch.Tensor,
+        noise: torch.Tensor,
         timestep: torch.Tensor
     ) -> torch.Tensor:
         """
-        Convert the diffusion network's x0 prediction to noise predidction.
-        x0: the predicted clean data with shape [B, C, H, W]
-        xt: the input noisy data with shape [B, C, H, W]
-        timestep: the timestep with shape [B]
+        Forward diffusion: add noise to clean samples.
 
-        noise = (xt-sqrt(alpha_t)*x0) / sqrt(beta_t) (eq 11 in https://arxiv.org/abs/2311.18828)
+        Args:
+            original_samples: Clean samples [B, C, H, W]
+            noise: Noise to add [B, C, H, W]
+            timestep: Timesteps [B] or [B, T]
+
+        Returns:
+            Noisy samples [B, C, H, W]
         """
-        # use higher precision for calculations
-        original_dtype = x0.dtype
-        x0, xt, alphas_cumprod = map(
-            lambda x: x.double().to(x0.device), [x0, xt,
-                                                 self.alphas_cumprod]
-        )
+        pass
 
-        alpha_prod_t = alphas_cumprod[timestep].reshape(-1, 1, 1, 1)
-        beta_prod_t = 1 - alpha_prod_t
-
-        noise_pred = (xt - alpha_prod_t **
-                      (0.5) * x0) / beta_prod_t ** (0.5)
-        return noise_pred.to(original_dtype)
-
-    def convert_noise_to_x0(
-        self, noise: torch.Tensor, xt: torch.Tensor,
-        timestep: torch.Tensor
+    @abstractmethod
+    def step(
+        self,
+        model_output: torch.Tensor,
+        timestep: torch.Tensor,
+        sample: torch.Tensor,
+        **kwargs
     ) -> torch.Tensor:
         """
-        Convert the diffusion network's noise prediction to x0 predidction.
-        noise: the predicted noise with shape [B, C, H, W]
-        xt: the input noisy data with shape [B, C, H, W]
-        timestep: the timestep with shape [B]
+        Reverse diffusion: single denoising step.
 
-        x0 = (x_t - sqrt(beta_t) * noise) / sqrt(alpha_t) (eq 11 in https://arxiv.org/abs/2311.18828)
+        Args:
+            model_output: Model prediction
+            timestep: Current timestep
+            sample: Current noisy sample
+            **kwargs: Additional scheduler-specific arguments
+
+        Returns:
+            Denoised sample for next step
         """
-        # use higher precision for calculations
-        original_dtype = noise.dtype
-        noise, xt, alphas_cumprod = map(
-            lambda x: x.double().to(noise.device), [noise, xt,
-                                                    self.alphas_cumprod]
-        )
-        alpha_prod_t = alphas_cumprod[timestep].reshape(-1, 1, 1, 1)
-        beta_prod_t = 1 - alpha_prod_t
+        pass
 
-        x0_pred = (xt - beta_prod_t **
-                   (0.5) * noise) / alpha_prod_t ** (0.5)
-        return x0_pred.to(original_dtype)
-
-    def convert_velocity_to_x0(
-        self, velocity: torch.Tensor, xt: torch.Tensor,
-        timestep: torch.Tensor
+    def get_inference_timesteps(
+        self,
+        custom_steps: Optional[List[int]] = None,
+        warp: bool = False
     ) -> torch.Tensor:
         """
-        Convert the diffusion network's velocity prediction to x0 predidction.
-        velocity: the predicted noise with shape [B, C, H, W]
-        xt: the input noisy data with shape [B, C, H, W]
-        timestep: the timestep with shape [B]
+        Get timesteps for inference, optionally warped or custom.
 
-        v = sqrt(alpha_t) * noise - sqrt(beta_t) x0
-        noise = (xt-sqrt(alpha_t)*x0) / sqrt(beta_t)
-        given v, x_t, we have
-        x0 = sqrt(alpha_t) * x_t - sqrt(beta_t) * v
-        see derivations https://chatgpt.com/share/679fb6c8-3a30-8008-9b0e-d1ae892dac56
+        This centralizes ALL timestep logic in the scheduler.
+
+        Args:
+            custom_steps: Custom timestep values (e.g., [1000, 750, 500, 250])
+            warp: Whether to warp custom steps using the scheduler's mapping
+
+        Returns:
+            Tensor of timesteps to use for inference
         """
-        # use higher precision for calculations
-        original_dtype = velocity.dtype
-        velocity, xt, alphas_cumprod = map(
-            lambda x: x.double().to(velocity.device), [velocity, xt,
-                                                       self.alphas_cumprod]
-        )
-        alpha_prod_t = alphas_cumprod[timestep].reshape(-1, 1, 1, 1)
-        beta_prod_t = 1 - alpha_prod_t
+        if custom_steps is None:
+            # Use default timesteps from set_timesteps()
+            return self.timesteps.clone()
 
-        x0_pred = (alpha_prod_t ** 0.5) * xt - (beta_prod_t ** 0.5) * velocity
-        return x0_pred.to(original_dtype)
+        steps_tensor = torch.tensor(custom_steps, dtype=torch.long)
+
+        if not warp:
+            return steps_tensor
+
+        # Warp timesteps using scheduler's mapping
+        # This replaces the _prepare_denoising_steps logic in Pipeline
+        timesteps_extended = torch.cat([
+            self.timesteps.cpu(),
+            torch.tensor([0], dtype=torch.float32)
+        ])
+        warped_steps = timesteps_extended[1000 - steps_tensor]
+
+        return warped_steps
 
 
-class FlowMatchScheduler():
+class FlowMatchingScheduler(DiffusionScheduler):
+    """
+    Flow Matching scheduler for continuous-time diffusion.
 
-    def __init__(self, num_inference_steps=100, num_train_timesteps=1000, shift=3.0, sigma_max=1.0, sigma_min=0.003 / 1.002, inverse_timesteps=False, extra_one_step=False, reverse_sigmas=False):
-        self.num_train_timesteps = num_train_timesteps
+    This implements the Rectified Flow formulation where:
+    - x_t = (1 - sigma_t) * x_0 + sigma_t * noise
+    - Velocity prediction: v = noise - x_0
+    """
+
+    def __init__(
+        self,
+        num_train_timesteps: int = 1000,
+        num_inference_steps: int = 100,
+        shift: float = 3.0,
+        sigma_max: float = 1.0,
+        sigma_min: float = 0.003 / 1.002,
+        inverse_timesteps: bool = False,
+        extra_one_step: bool = False,
+        reverse_sigmas: bool = False
+    ):
+        """
+        Initialize Flow Matching scheduler.
+
+        Args:
+            num_train_timesteps: Total timesteps for training
+            num_inference_steps: Steps for inference
+            shift: Time-shift parameter for the flow
+            sigma_max: Maximum noise level
+            sigma_min: Minimum noise level
+            inverse_timesteps: Whether to reverse timestep order
+            extra_one_step: Add extra step at the end
+            reverse_sigmas: Reverse sigma values
+        """
+        super().__init__(num_train_timesteps, num_inference_steps)
+
         self.shift = shift
         self.sigma_max = sigma_max
         self.sigma_min = sigma_min
         self.inverse_timesteps = inverse_timesteps
         self.extra_one_step = extra_one_step
         self.reverse_sigmas = reverse_sigmas
+
+        # Initialize timesteps
         self.set_timesteps(num_inference_steps)
 
-    def set_timesteps(self, num_inference_steps=100, denoising_strength=1.0, training=False):
-        sigma_start = self.sigma_min + \
-            (self.sigma_max - self.sigma_min) * denoising_strength
+    def set_timesteps(
+        self,
+        num_inference_steps: Optional[int] = None,
+        denoising_strength: float = 1.0,
+        training: bool = False
+    ) -> None:
+        """
+        Set timesteps for inference.
+
+        Args:
+            num_inference_steps: Number of steps
+            denoising_strength: Denoising strength (0.0 to 1.0)
+            training: Whether to compute training weights
+        """
+        if num_inference_steps is not None:
+            self.num_inference_steps = num_inference_steps
+
+        # Compute sigma schedule
+        sigma_start = self.sigma_min + (self.sigma_max - self.sigma_min) * denoising_strength
+
         if self.extra_one_step:
             self.sigmas = torch.linspace(
-                sigma_start, self.sigma_min, num_inference_steps + 1)[:-1]
+                sigma_start, self.sigma_min, self.num_inference_steps + 1
+            )[:-1]
         else:
             self.sigmas = torch.linspace(
-                sigma_start, self.sigma_min, num_inference_steps)
+                sigma_start, self.sigma_min, self.num_inference_steps
+            )
+
+        # Apply transformations
         if self.inverse_timesteps:
             self.sigmas = torch.flip(self.sigmas, dims=[0])
-        self.sigmas = self.shift * self.sigmas / \
-            (1 + (self.shift - 1) * self.sigmas)
+
+        # Time-shift transformation
+        self.sigmas = self.shift * self.sigmas / (1 + (self.shift - 1) * self.sigmas)
+
         if self.reverse_sigmas:
             self.sigmas = 1 - self.sigmas
+
+        # Map to discrete timesteps
         self.timesteps = self.sigmas * self.num_train_timesteps
+
+        # Compute training weights if needed
         if training:
             x = self.timesteps
-            y = torch.exp(-2 * ((x - num_inference_steps / 2) /
-                          num_inference_steps) ** 2)
+            y = torch.exp(-2 * ((x - self.num_inference_steps / 2) / self.num_inference_steps) ** 2)
             y_shifted = y - y.min()
-            bsmntw_weighing = y_shifted * \
-                (num_inference_steps / y_shifted.sum())
-            self.linear_timesteps_weights = bsmntw_weighing
+            self.training_weights = y_shifted * (self.num_inference_steps / y_shifted.sum())
 
-    def step(self, model_output, timestep, sample, to_final=False):
+    def add_noise(
+        self,
+        original_samples: torch.Tensor,
+        noise: torch.Tensor,
+        timestep: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Add noise according to flow matching schedule.
+
+        Formula: x_t = (1 - sigma_t) * x_0 + sigma_t * noise
+
+        Args:
+            original_samples: Clean samples [B, C, H, W] or [B*T, C, H, W]
+            noise: Noise [B, C, H, W] or [B*T, C, H, W]
+            timestep: Timesteps [B] or [B*T]
+
+        Returns:
+            Noisy samples
+        """
+        # Flatten timestep if needed
         if timestep.ndim == 2:
             timestep = timestep.flatten(0, 1)
-        self.sigmas = self.sigmas.to(model_output.device)
-        self.timesteps = self.timesteps.to(model_output.device)
-        timestep_id = torch.argmin(
-            (self.timesteps.unsqueeze(0) - timestep.unsqueeze(1)).abs(), dim=1)
-        sigma = self.sigmas[timestep_id].reshape(-1, 1, 1, 1)
-        if to_final or (timestep_id + 1 >= len(self.timesteps)).any():
-            sigma_ = 1 if (
-                self.inverse_timesteps or self.reverse_sigmas) else 0
-        else:
-            sigma_ = self.sigmas[timestep_id + 1].reshape(-1, 1, 1, 1)
-        prev_sample = sample + model_output * (sigma_ - sigma)
-        return prev_sample
 
-    def add_noise(self, original_samples, noise, timestep):
-        """
-        Diffusion forward corruption process.
-        Input:
-            - clean_latent: the clean latent with shape [B*T, C, H, W]
-            - noise: the noise with shape [B*T, C, H, W]
-            - timestep: the timestep with shape [B*T]
-        Output: the corrupted latent with shape [B*T, C, H, W]
-        """
-        if timestep.ndim == 2:
-            timestep = timestep.flatten(0, 1)
+        # Move to correct device
         self.sigmas = self.sigmas.to(noise.device)
         self.timesteps = self.timesteps.to(noise.device)
+
+        # Find sigma for each timestep
         timestep_id = torch.argmin(
-            (self.timesteps.unsqueeze(0) - timestep.unsqueeze(1)).abs(), dim=1)
+            (self.timesteps.unsqueeze(0) - timestep.unsqueeze(1)).abs(),
+            dim=1
+        )
         sigma = self.sigmas[timestep_id].reshape(-1, 1, 1, 1)
-        sample = (1 - sigma) * original_samples + sigma * noise
-        return sample.type_as(noise)
 
-    def training_target(self, sample, noise, timestep):
-        target = noise - sample
-        return target
+        # Apply noise
+        noisy_sample = (1 - sigma) * original_samples + sigma * noise
 
-    def training_weight(self, timestep):
+        return noisy_sample.type_as(noise)
+
+    def step(
+        self,
+        model_output: torch.Tensor,
+        timestep: torch.Tensor,
+        sample: torch.Tensor,
+        to_final: bool = False
+    ) -> torch.Tensor:
         """
-        Input:
-            - timestep: the timestep with shape [B*T]
-        Output: the corresponding weighting [B*T]
+        Single denoising step.
+
+        Args:
+            model_output: Model's flow prediction
+            timestep: Current timestep
+            sample: Current noisy sample
+            to_final: Whether this is the final step
+
+        Returns:
+            Denoised sample
         """
         if timestep.ndim == 2:
             timestep = timestep.flatten(0, 1)
-        self.linear_timesteps_weights = self.linear_timesteps_weights.to(timestep.device)
+
+        self.sigmas = self.sigmas.to(model_output.device)
+        self.timesteps = self.timesteps.to(model_output.device)
+
+        # Find current sigma
         timestep_id = torch.argmin(
-            (self.timesteps.unsqueeze(1) - timestep.unsqueeze(0)).abs(), dim=0)
-        weights = self.linear_timesteps_weights[timestep_id]
-        return weights
+            (self.timesteps.unsqueeze(0) - timestep.unsqueeze(1)).abs(),
+            dim=1
+        )
+        sigma = self.sigmas[timestep_id].reshape(-1, 1, 1, 1)
+
+        # Determine next sigma
+        if to_final or (timestep_id + 1 >= len(self.timesteps)).any():
+            sigma_next = 1 if (self.inverse_timesteps or self.reverse_sigmas) else 0
+        else:
+            sigma_next = self.sigmas[timestep_id + 1].reshape(-1, 1, 1, 1)
+
+        # Flow matching step
+        prev_sample = sample + model_output * (sigma_next - sigma)
+
+        return prev_sample
+
+    def convert_flow_to_x0(
+        self,
+        flow_pred: torch.Tensor,
+        xt: torch.Tensor,
+        timestep: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Convert flow prediction to x0 (clean sample) prediction.
+
+        Flow matching: v = noise - x_0
+        x_t = (1 - sigma_t) * x_0 + sigma_t * noise
+        Therefore: x_0 = x_t - sigma_t * v
+
+        Args:
+            flow_pred: Flow prediction [B, C, H, W]
+            xt: Noisy sample [B, C, H, W]
+            timestep: Timesteps [B]
+
+        Returns:
+            x0 prediction [B, C, H, W]
+        """
+        original_dtype = flow_pred.dtype
+
+        # Use double precision for numerical stability
+        flow_pred = flow_pred.double().to(flow_pred.device)
+        xt = xt.double().to(flow_pred.device)
+        sigmas = self.sigmas.double().to(flow_pred.device)
+        timesteps = self.timesteps.double().to(flow_pred.device)
+
+        # Find sigma for timestep
+        timestep_id = torch.argmin(
+            (timesteps.unsqueeze(0) - timestep.unsqueeze(1)).abs(),
+            dim=1
+        )
+        sigma_t = sigmas[timestep_id].reshape(-1, 1, 1, 1)
+
+        # Derive x0
+        x0_pred = xt - sigma_t * flow_pred
+
+        return x0_pred.to(original_dtype)
+
+    def convert_x0_to_flow(
+        self,
+        x0_pred: torch.Tensor,
+        xt: torch.Tensor,
+        timestep: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Convert x0 prediction to flow prediction.
+
+        v = (x_t - x_0) / sigma_t
+
+        Args:
+            x0_pred: x0 prediction [B, C, H, W]
+            xt: Noisy sample [B, C, H, W]
+            timestep: Timesteps [B]
+
+        Returns:
+            Flow prediction [B, C, H, W]
+        """
+        original_dtype = x0_pred.dtype
+
+        x0_pred = x0_pred.double().to(x0_pred.device)
+        xt = xt.double().to(x0_pred.device)
+        sigmas = self.sigmas.double().to(x0_pred.device)
+        timesteps = self.timesteps.double().to(x0_pred.device)
+
+        timestep_id = torch.argmin(
+            (timesteps.unsqueeze(0) - timestep.unsqueeze(1)).abs(),
+            dim=1
+        )
+        sigma_t = sigmas[timestep_id].reshape(-1, 1, 1, 1)
+
+        flow_pred = (xt - x0_pred) / sigma_t
+
+        return flow_pred.to(original_dtype)
+
+    def training_target(
+        self,
+        sample: torch.Tensor,
+        noise: torch.Tensor,
+        timestep: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Compute training target (flow).
+
+        Args:
+            sample: Clean sample
+            noise: Noise
+            timestep: Timesteps
+
+        Returns:
+            Training target (velocity)
+        """
+        return noise - sample
+
+    def training_weight(self, timestep: torch.Tensor) -> torch.Tensor:
+        """
+        Get training weight for timesteps.
+
+        Args:
+            timestep: Timesteps [B] or [B*T]
+
+        Returns:
+            Weights [B] or [B*T]
+        """
+        if timestep.ndim == 2:
+            timestep = timestep.flatten(0, 1)
+
+        self.training_weights = self.training_weights.to(timestep.device)
+
+        timestep_id = torch.argmin(
+            (self.timesteps.unsqueeze(1) - timestep.unsqueeze(0)).abs(),
+            dim=0
+        )
+
+        return self.training_weights[timestep_id]
