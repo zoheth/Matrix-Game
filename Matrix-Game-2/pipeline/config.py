@@ -165,6 +165,9 @@ class InferenceConfig:
     warp_denoising_step: bool = True
     """Whether to warp timesteps using the scheduler's timestep mapping"""
 
+    timestep_shift: float = 5.0
+    """Shift parameter for flow matching scheduler (controls noise schedule)"""
+
     context_noise: int = 0
     """Noise level when caching context (0 = clean)"""
 
@@ -248,12 +251,15 @@ class PipelineConfig:
         # Extract inference config
         denoising_steps = getattr(args, "denoising_step_list", [1000, 750, 500, 250])
         warp_denoising = getattr(args, "warp_denoising_step", True)
+        # timestep_shift can be in model_kwargs or at top level
+        timestep_shift = model_kwargs.get("timestep_shift", getattr(args, "timestep_shift", 5.0))
         context_noise = getattr(args, "context_noise", 0)
         num_frame_per_block = getattr(args, "num_frame_per_block", 1)
 
         inference_config = InferenceConfig(
             denoising_steps=denoising_steps,
             warp_denoising_step=warp_denoising,
+            timestep_shift=timestep_shift,
             context_noise=context_noise,
             num_frame_per_block=num_frame_per_block
         )

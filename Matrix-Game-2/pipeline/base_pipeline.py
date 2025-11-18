@@ -59,7 +59,7 @@ class BaseCausalInferencePipeline(torch.nn.Module, ABC):
         # Pipeline owns the scheduler (not generator)
         self.scheduler = FlowMatchingScheduler(
             num_train_timesteps=1000,
-            shift=getattr(generator, 'timestep_shift', 5.0),
+            shift=config.inference.timestep_shift,
             sigma_min=0.0,
             extra_one_step=True
         )
