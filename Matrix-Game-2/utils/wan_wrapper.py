@@ -9,6 +9,7 @@ from wan.modules.model import WanModel #, RegisterTokens, GanAttentionBlock
 from wan.modules.vae import _video_vae
 # from wan.modules.t5 import umt5_xxl
 from wan.modules.causal_model import CausalWanModel
+from wan.modules.action_context import ActionContext
 
 
 class WanVAEWrapper(torch.nn.Module): # todo
@@ -92,8 +93,12 @@ class WanDiffusionWrapper(torch.nn.Module):
 
     def forward(
         self,
-        noisy_image_or_video: torch.Tensor, conditional_dict: dict,
-        timestep: torch.Tensor, kv_cache: Optional[List[dict]] = None, kv_cache_mouse: Optional[List[dict]] = None, kv_cache_keyboard: Optional[List[dict]] = None,
+        noisy_image_or_video: torch.Tensor,
+        conditional_dict: dict,
+        timestep: torch.Tensor,
+        kv_cache: Optional[List[dict]] = None,
+        kv_cache_mouse: Optional[List[dict]] = None,
+        kv_cache_keyboard: Optional[List[dict]] = None,
         crossattn_cache: Optional[List[dict]] = None,
         current_start: Optional[int] = None,
         cache_start: Optional[int] = None
@@ -105,33 +110,49 @@ class WanDiffusionWrapper(torch.nn.Module):
             input_timestep = timestep[:, 0]
         else:
             input_timestep = timestep
-        logits = None
+
+        # Extract action conditions from conditional_dict
+        mouse_cond = conditional_dict.get('mouse_cond')
+        keyboard_cond = conditional_dict.get('keyboard_cond')
+
+        # Create ActionContext if action conditions exist
+        action_context = None
+        if mouse_cond is not None or keyboard_cond is not None:
+            action_context = ActionContext(
+                mouse_cond=mouse_cond,
+                keyboard_cond=keyboard_cond,
+                # Note: kv_cache lists will be indexed per-block inside the model
+                kv_cache_mouse=None,
+                kv_cache_keyboard=None,
+            )
+
+        # Build model input (exclude action fields)
+        model_cond = {
+            k: v for k, v in conditional_dict.items()
+            if k not in ('mouse_cond', 'keyboard_cond')
+        }
 
         with torch.profiler.record_function("DiffusionModel_Forward"):
             if kv_cache is not None:
                 flow_pred = self.model(
-                    noisy_image_or_video.to(self.model.dtype),#.permute(0, 2, 1, 3, 4),
-                    t=input_timestep, **conditional_dict,
-                    # seq_len=self.seq_len,
+                    noisy_image_or_video.to(self.model.dtype),
+                    t=input_timestep,
+                    **model_cond,
+                    action_context=action_context,
                     kv_cache=kv_cache,
-                    kv_cache_mouse=kv_cache_mouse, kv_cache_keyboard=kv_cache_keyboard,
+                    kv_cache_mouse=kv_cache_mouse,
+                    kv_cache_keyboard=kv_cache_keyboard,
                     crossattn_cache=crossattn_cache,
                     current_start=current_start,
                     cache_start=cache_start
-                )#.permute(0, 2, 1, 3, 4)
-
+                )
             else:
                 flow_pred = self.model(
-                    noisy_image_or_video.to(self.model.dtype),#.permute(0, 2, 1, 3, 4),
-                    t=input_timestep, **conditional_dict)
-                #.permute(0, 2, 1, 3, 4)
+                    noisy_image_or_video.to(self.model.dtype),
+                    t=input_timestep,
+                    **model_cond,
+                    action_context=action_context
+                )
 
-        # Note: Flow to X0 conversion is now handled by pipeline with scheduler
-        # This forward method now only returns the flow prediction
-        # The pipeline will call scheduler.convert_flow_to_x0() separately
-        pred_x0 = None  # Will be computed by pipeline if needed
-
-        # For backward compatibility, return flow_pred twice if logits is None
-        # New code should only use flow_pred
         return flow_pred, flow_pred
 

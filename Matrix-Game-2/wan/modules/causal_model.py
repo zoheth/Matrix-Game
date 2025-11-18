@@ -8,6 +8,7 @@ from wan.modules.model import (
     MLPProj,
     sinusoidal_embedding_1d
 )
+from wan.modules.action_context import ActionContext, BlockMaskFactory
 from diffusers.loaders import FromOriginalModelMixin, PeftAdapterMixin
 from torch.nn.attention.flex_attention import create_block_mask, flex_attention
 from diffusers.configuration_utils import ConfigMixin, register_to_config
@@ -18,6 +19,7 @@ import torch
 import math
 import os
 import torch.distributed as dist
+from typing import Optional, List, Dict
 
 # 允许通过环境变量选择使用模块化版本
 USE_MODULAR_ACTION = os.environ.get("USE_MODULAR_ACTION", "1") == "1"
@@ -277,20 +279,19 @@ class CausalWanAttentionBlock(nn.Module):
 
     def forward(
         self,
-        x,
-        ada_params,
-        seq_lens,
-        grid_sizes,
-        freqs,
-        context,
-        block_mask,
-        kv_cache=None,
-        crossattn_cache=None,
-        current_start=0,
-        cache_start=None,
-        context_lens=None,
-        **action_kwargs
-    ):
+        x: torch.Tensor,
+        ada_params: torch.Tensor,
+        seq_lens: torch.Tensor,
+        grid_sizes: torch.Tensor,
+        freqs: torch.Tensor,
+        context: torch.Tensor,
+        block_mask: BlockMask,
+        kv_cache: Optional[dict] = None,
+        crossattn_cache: Optional[dict] = None,
+        current_start: int = 0,
+        cache_start: Optional[int] = None,
+        action_context: Optional[ActionContext] = None
+    ) -> torch.Tensor:
         r"""
         Forward pass through the attention block.
 
@@ -298,7 +299,7 @@ class CausalWanAttentionBlock(nn.Module):
             x: Hidden states [B, L, C]
             ada_params: AdaLN modulation parameters [B, F, 6, C] where F = num_frames
             seq_lens: Sequence lengths [B]
-            grid_sizes: Spatial-temporal grid [3] = (num_frames, height, width) for inference
+            grid_sizes: Spatial-temporal grid [3] = (num_frames, height, width)
             freqs: RoPE frequencies [max_len, head_dim/2]
             context: Visual context for cross-attention
             block_mask: Attention mask for self-attention
@@ -306,8 +307,7 @@ class CausalWanAttentionBlock(nn.Module):
             crossattn_cache: Cache for cross-attention
             current_start: Current position in sequence (for cache indexing)
             cache_start: Start position of cache
-            context_lens: Context sequence lengths
-            **action_kwargs: All action-related parameters (mouse_cond, keyboard_cond, block_mask_*, kv_cache_*, etc.)
+            action_context: Optional ActionContext encapsulating all action-related parameters
 
         Returns:
             Updated hidden states [B, L, C]
@@ -339,7 +339,7 @@ class CausalWanAttentionBlock(nn.Module):
             x, context, shift_ffn, scale_ffn, gate_ffn,
             num_frames, frame_seqlen, grid_sizes,
             crossattn_cache, current_start,
-            **action_kwargs
+            action_context
         )
 
         return x
@@ -395,13 +395,15 @@ class CausalWanAttentionBlock(nn.Module):
         grid_sizes: torch.Tensor,
         crossattn_cache,
         current_start: int,
-        **action_kwargs
+        action_context: Optional[ActionContext]
     ) -> torch.Tensor:
         """
         Apply cross-attention, optional action module, and FFN with AdaLN.
 
         This method replaces the nested cross_attn_ffn function.
-        All action-related parameters are passed via **action_kwargs to avoid parameter explosion.
+
+        Args:
+            action_context: Optional ActionContext encapsulating all action parameters
         """
         # Cross-attention
         with torch.profiler.record_function("CausalWanAttentionBlock/cross_attn"):
@@ -413,11 +415,11 @@ class CausalWanAttentionBlock(nn.Module):
 
         # Optional action module
         if self.action_model is not None:
-            mouse_cond = action_kwargs.get('mouse_cond')
-            keyboard_cond = action_kwargs.get('keyboard_cond')
-
-            assert mouse_cond is not None or keyboard_cond is not None, \
-                "ActionModule enabled but no action conditions provided"
+            if action_context is None or not action_context.has_any_condition:
+                raise ValueError(
+                    "ActionModule is enabled but no ActionContext provided. "
+                    "Either pass action_context or use legacy action_kwargs."
+                )
 
             with torch.profiler.record_function("CausalWanAttentionBlock/action_module"):
                 # Compute start_frame from current_start
@@ -425,21 +427,24 @@ class CausalWanAttentionBlock(nn.Module):
                 spatial_tokens_per_frame = int(grid_sizes[1] * grid_sizes[2])
                 start_frame = current_start // spatial_tokens_per_frame
 
+                # Update action_context with computed start_frame
+                action_context.start_frame = start_frame
+
                 x = self.action_model(
                     x.to(context.dtype),
                     grid_sizes[0],  # num_frames
                     grid_sizes[1],  # height
                     grid_sizes[2],  # width
-                    mouse_cond,
-                    keyboard_cond,
-                    action_kwargs.get('block_mask_mouse'),
-                    action_kwargs.get('block_mask_keyboard'),
+                    action_context.mouse_cond,
+                    action_context.keyboard_cond,
+                    action_context.block_mask_mouse,
+                    action_context.block_mask_keyboard,
                     is_causal=True,
-                    kv_cache_mouse=action_kwargs.get('kv_cache_mouse'),
-                    kv_cache_keyboard=action_kwargs.get('kv_cache_keyboard'),
-                    start_frame=start_frame,
-                    use_rope_keyboard=action_kwargs.get('use_rope_keyboard', False),
-                    num_frame_per_block=action_kwargs.get('num_frame_per_block', 3)
+                    kv_cache_mouse=action_context.kv_cache_mouse,
+                    kv_cache_keyboard=action_context.kv_cache_keyboard,
+                    start_frame=action_context.start_frame,
+                    use_rope_keyboard=action_context.use_rope_keyboard,
+                    num_frame_per_block=action_context.num_frame_per_block
                 )
 
         # Feed-forward network with AdaLN
@@ -625,6 +630,78 @@ class CausalWanModel(ModelMixin, ConfigMixin, FromOriginalModelMixin, PeftAdapte
     def _set_gradient_checkpointing(self, module, value=False):
         self.gradient_checkpointing = value
 
+    def _get_or_create_masks(
+        self,
+        device: torch.device,
+        num_frames: int,
+        frame_seqlen: int,
+        block_mask: Optional[BlockMask] = None,
+        block_mask_mouse: Optional[BlockMask] = None,
+        block_mask_keyboard: Optional[BlockMask] = None
+    ):
+        """
+        Get block masks from arguments or lazily create them.
+
+        This method provides backward compatibility with the old lazy initialization
+        while allowing Pipeline to provide pre-computed masks.
+
+        Args:
+            device: Device to create masks on
+            num_frames: Number of frames
+            frame_seqlen: Sequence length per frame
+            block_mask: Optional pre-computed visual mask (from Pipeline)
+            block_mask_mouse: Optional pre-computed mouse mask
+            block_mask_keyboard: Optional pre-computed keyboard mask
+
+        Returns:
+            Tuple of (block_mask, block_mask_mouse, block_mask_keyboard)
+        """
+        # Visual mask: use provided or create lazily
+        if block_mask is None:
+            if self.block_mask is None:
+                self.block_mask = self._prepare_blockwise_causal_attn_mask(
+                    device, num_frames=num_frames, frame_seqlen=frame_seqlen,
+                    num_frame_per_block=self.num_frame_per_block,
+                    local_attn_size=self.local_attn_size
+                )
+            block_mask = self.block_mask
+        else:
+            # Update cached mask if provided externally
+            self.block_mask = block_mask
+
+        # Keyboard mask: use provided or create lazily
+        if block_mask_keyboard is None and (self.use_action_module):
+            if self.block_mask_keyboard is None:
+                if self.use_rope_keyboard == False:
+                    self.block_mask_keyboard = self._prepare_blockwise_causal_attn_mask_keyboard(
+                        device, num_frames=num_frames, frame_seqlen=frame_seqlen,
+                        num_frame_per_block=self.num_frame_per_block,
+                        local_attn_size=self.local_attn_size
+                    )
+                else:
+                    self.block_mask_keyboard = self._prepare_blockwise_causal_attn_mask_action(
+                        device, num_frames=num_frames, frame_seqlen=1,
+                        num_frame_per_block=self.num_frame_per_block,
+                        local_attn_size=self.local_attn_size
+                    )
+            block_mask_keyboard = self.block_mask_keyboard
+        elif block_mask_keyboard is not None:
+            self.block_mask_keyboard = block_mask_keyboard
+
+        # Mouse mask: use provided or create lazily
+        if block_mask_mouse is None and (self.use_action_module):
+            if self.block_mask_mouse is None:
+                self.block_mask_mouse = self._prepare_blockwise_causal_attn_mask_action(
+                    device, num_frames=num_frames, frame_seqlen=1,
+                    num_frame_per_block=self.num_frame_per_block,
+                    local_attn_size=self.local_attn_size
+                )
+            block_mask_mouse = self.block_mask_mouse
+        elif block_mask_mouse is not None:
+            self.block_mask_mouse = block_mask_mouse
+
+        return block_mask, block_mask_mouse, block_mask_keyboard
+
     @staticmethod
     def _prepare_blockwise_causal_attn_mask(
         device: torch.device | str, num_frames: int = 9,
@@ -770,10 +847,12 @@ class CausalWanModel(ModelMixin, ConfigMixin, FromOriginalModelMixin, PeftAdapte
         self,
         x,
         t,
-        visual_context, cond_concat, mouse_cond=None, keyboard_cond=None,
+        visual_context,
+        cond_concat,
+        action_context: Optional[ActionContext] = None,
         kv_cache: dict = None,
-        kv_cache_mouse=None,
-        kv_cache_keyboard=None,
+        kv_cache_mouse: Optional[List[dict]] = None,
+        kv_cache_keyboard: Optional[List[dict]] = None,
         crossattn_cache: dict = None,
         current_start: int = 0,
         cache_start: int = 0
@@ -803,7 +882,7 @@ class CausalWanModel(ModelMixin, ConfigMixin, FromOriginalModelMixin, PeftAdapte
                 List of denoised video tensors with original input shapes [C_out, F, H / 8, W / 8]
         """
 
-        if mouse_cond is not None or keyboard_cond is not None:
+        if action_context is not None:
             assert self.use_action_module == True
         # params
         device = self.patch_embedding.weight.device
@@ -833,6 +912,14 @@ class CausalWanModel(ModelMixin, ConfigMixin, FromOriginalModelMixin, PeftAdapte
         with torch.profiler.record_function("CausalWanModel/visual_embedding"):
             context_lens = None
             context = self.img_emb(visual_context)
+
+        # Set block masks in action_context if provided
+        if action_context is not None:
+            action_context.block_mask_mouse = self.block_mask_mouse
+            action_context.block_mask_keyboard = self.block_mask_keyboard
+            action_context.use_rope_keyboard = self.use_rope_keyboard
+            action_context.num_frame_per_block = self.num_frame_per_block
+
         # arguments
         kwargs = dict(
             ada_params=e0,
@@ -840,14 +927,8 @@ class CausalWanModel(ModelMixin, ConfigMixin, FromOriginalModelMixin, PeftAdapte
             grid_sizes=grid_sizes,
             freqs=self.freqs,
             context=context,
-            mouse_cond=mouse_cond,
-            context_lens=context_lens,
-            keyboard_cond=keyboard_cond,
             block_mask=self.block_mask,
-            block_mask_mouse=self.block_mask_mouse,
-            block_mask_keyboard=self.block_mask_keyboard,
-            use_rope_keyboard=self.use_rope_keyboard,
-            num_frame_per_block=self.num_frame_per_block
+            action_context=action_context
         )
 
         def create_custom_forward(module):
@@ -858,33 +939,29 @@ class CausalWanModel(ModelMixin, ConfigMixin, FromOriginalModelMixin, PeftAdapte
         with torch.profiler.record_function("CausalWanModel/transformer_blocks"):
             for block_index, block in enumerate(self.blocks):
                 with torch.profiler.record_function(f"CausalWanModel/block_{block_index}"):
-                    if torch.is_grad_enabled() and self.gradient_checkpointing:
-                        kwargs.update(
-                            {
-                                "kv_cache": kv_cache[block_index],
-                                "kv_cache_mouse": kv_cache_mouse[block_index],
-                                "kv_cache_keyboard": kv_cache_keyboard[block_index],
-                                "current_start": current_start,
-                                "cache_start": cache_start,
-                            }
+                    # Update ActionContext with block-specific KV caches
+                    if action_context is not None:
+                        action_context.kv_cache_mouse = kv_cache_mouse[block_index] if kv_cache_mouse else None
+                        action_context.kv_cache_keyboard = kv_cache_keyboard[block_index] if kv_cache_keyboard else None
 
-                        )
+                    if torch.is_grad_enabled() and self.gradient_checkpointing:
+                        kwargs.update({
+                            "kv_cache": kv_cache[block_index],
+                            "current_start": current_start,
+                            "cache_start": cache_start,
+                        })
                         x = torch.utils.checkpoint.checkpoint(
                             create_custom_forward(block),
                             x, **kwargs,
                             use_reentrant=False,
                         )
                     else:
-                        kwargs.update(
-                            {
-                                "kv_cache": kv_cache[block_index],
-                                "kv_cache_mouse": kv_cache_mouse[block_index],
-                                "kv_cache_keyboard": kv_cache_keyboard[block_index],
-                                "crossattn_cache": crossattn_cache[block_index],
-                                "current_start": current_start,
-                                "cache_start": cache_start,
-                            }
-                        )
+                        kwargs.update({
+                            "kv_cache": kv_cache[block_index],
+                            "crossattn_cache": crossattn_cache[block_index],
+                            "current_start": current_start,
+                            "cache_start": cache_start,
+                        })
                         x = block(x, **kwargs)
 
         # head
@@ -899,7 +976,9 @@ class CausalWanModel(ModelMixin, ConfigMixin, FromOriginalModelMixin, PeftAdapte
         self,
         x,
         t,
-        visual_context, cond_concat, mouse_cond=None, keyboard_cond=None,
+        visual_context,
+        cond_concat,
+        action_context: Optional[ActionContext] = None,
     ):
         r"""
         Forward pass through the diffusion model
@@ -923,42 +1002,27 @@ class CausalWanModel(ModelMixin, ConfigMixin, FromOriginalModelMixin, PeftAdapte
                 List of denoised video tensors with original input shapes [C_out, F, H / 8, W / 8]
         """
         # params
-        if mouse_cond is not None or keyboard_cond is not None:
+        if action_context is not None:
             assert self.use_action_module == True
         device = self.patch_embedding.weight.device
         if self.freqs.device != device:
             self.freqs = self.freqs.to(device)
         x = torch.cat([x, cond_concat], dim=1)
-        # Construct blockwise causal attn mask
-        if self.block_mask is None:
-            self.block_mask = self._prepare_blockwise_causal_attn_mask(
-                device, num_frames=x.shape[2],
-                frame_seqlen=x.shape[-2] * x.shape[-1] // (self.patch_size[1] * self.patch_size[2]),
-                num_frame_per_block=self.num_frame_per_block,
-                local_attn_size=self.local_attn_size
-            )
-        if self.block_mask_keyboard is None:
-            if self.use_rope_keyboard==False:
-                self.block_mask_keyboard = self._prepare_blockwise_causal_attn_mask_keyboard(
-                    device, num_frames=x.shape[2],
-                    frame_seqlen=x.shape[-2] * x.shape[-1] // (self.patch_size[1] * self.patch_size[2]) ,
-                    num_frame_per_block=self.num_frame_per_block,
-                    local_attn_size=self.local_attn_size
-                )
-            else:
-                self.block_mask_keyboard = self._prepare_blockwise_causal_attn_mask_action(
-                    device, num_frames=x.shape[2],
-                    frame_seqlen=1,
-                    num_frame_per_block=self.num_frame_per_block,
-                    local_attn_size=self.local_attn_size
-            )
-        if self.block_mask_mouse is None:
-            self.block_mask_mouse = self._prepare_blockwise_causal_attn_mask_action(
-                device, num_frames=x.shape[2],
-                frame_seqlen=1,
-                num_frame_per_block=self.num_frame_per_block,
-                local_attn_size=self.local_attn_size
-            )
+
+        # Get or create block masks (allows Pipeline to provide pre-computed masks)
+        num_frames = x.shape[2]
+        frame_seqlen = x.shape[-2] * x.shape[-1] // (self.patch_size[1] * self.patch_size[2])
+
+        block_mask, block_mask_mouse, block_mask_keyboard = self._get_or_create_masks(
+            device=device,
+            num_frames=num_frames,
+            frame_seqlen=frame_seqlen,
+            # Pipeline can pass masks here in the future
+            block_mask=None,
+            block_mask_mouse=None,
+            block_mask_keyboard=None
+        )
+
         x = self.patch_embedding(x)
         grid_sizes = torch.tensor(x.shape[2:], dtype=torch.long)
         # Ensure contiguous output after transpose
@@ -968,10 +1032,14 @@ class CausalWanModel(ModelMixin, ConfigMixin, FromOriginalModelMixin, PeftAdapte
             sinusoidal_embedding_1d(self.freq_dim, t.flatten()).type_as(x))
         e0 = self.time_projection(e).unflatten(
             1, (6, self.dim)).unflatten(dim=0, sizes=t.shape)
-            
+
         context_lens = None
         context = self.img_emb(visual_context)
-        
+
+        # Set block masks in action_context if provided
+        if action_context is not None:
+            action_context.block_mask_mouse = block_mask_mouse
+            action_context.block_mask_keyboard = block_mask_keyboard
 
         # arguments
         kwargs = dict(
@@ -980,14 +1048,8 @@ class CausalWanModel(ModelMixin, ConfigMixin, FromOriginalModelMixin, PeftAdapte
             grid_sizes=grid_sizes,
             freqs=self.freqs,
             context=context,
-            mouse_cond=mouse_cond,
-            context_lens=context_lens,
-            keyboard_cond=keyboard_cond,
-            block_mask=self.block_mask,
-            block_mask_mouse=self.block_mask_mouse,
-            block_mask_keyboard=self.block_mask_keyboard,
-            use_rope_keyboard=self.use_rope_keyboard,
-            num_frame_per_block=self.num_frame_per_block
+            block_mask=block_mask,
+            action_context=action_context
             )
 
         def create_custom_forward(module):
