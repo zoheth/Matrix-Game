@@ -98,9 +98,9 @@ class CausalWanSelfAttention(nn.Module):
         self.k = nn.Linear(dim, dim)
         self.v = nn.Linear(dim, dim)
         self.o = nn.Linear(dim, dim)
-        self.norm_q = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
-        self.norm_k = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
-
+    
+        self.norm_q = nn.RMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
+        self.norm_k = nn.RMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
     def forward(
         self,
         x,
@@ -257,9 +257,9 @@ class CausalWanAttentionBlock(nn.Module):
             self.action_model = None
 
         # Normalization layers
-        self.norm1 = WanLayerNorm(dim, eps)
-        self.norm2 = WanLayerNorm(dim, eps)
-        self.norm3 = WanLayerNorm(dim, eps, elementwise_affine=True) if cross_attn_norm else nn.Identity()
+        self.norm1 = nn.LayerNorm(dim, eps, elementwise_affine=False)
+        self.norm2 = nn.LayerNorm(dim, eps, elementwise_affine=False)
+        self.norm3 = nn.LayerNorm(dim, eps, elementwise_affine=True) if cross_attn_norm else nn.Identity()
 
         # Attention layers
         self.self_attn = CausalWanSelfAttention(dim, num_heads, local_attn_size, sink_size, qk_norm, eps)

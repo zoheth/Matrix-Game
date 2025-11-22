@@ -192,8 +192,12 @@ class MouseInjector(IAttentionInjector):
 
         # QK normalization
         head_dim = action_config.mouse_head_dim
-        self.q_norm = WanRMSNorm(head_dim, eps=1e-6) if action_config.qk_norm else nn.Identity()
-        self.k_norm = WanRMSNorm(head_dim, eps=1e-6) if action_config.qk_norm else nn.Identity()
+        # self.q_norm = WanRMSNorm(head_dim, eps=1e-6) if action_config.qk_norm else nn.Identity()
+        # self.k_norm = WanRMSNorm(head_dim, eps=1e-6) if action_config.qk_norm else nn.Identity()
+        self.q_norm = nn.RMSNorm(head_dim, eps=1e-6) if action_config.qk_norm else nn.Identity()
+        self.k_norm = nn.RMSNorm(head_dim, eps=1e-6) if action_config.qk_norm else nn.Identity()
+
+
 
         # Output projection
         self.proj_mouse = nn.Linear(
@@ -350,8 +354,10 @@ class KeyboardInjector(IAttentionInjector):
 
         # QK normalization
         head_dim = action_config.keyboard_head_dim
-        self.q_norm = WanRMSNorm(head_dim, eps=1e-6) if action_config.qk_norm else nn.Identity()
-        self.k_norm = WanRMSNorm(head_dim, eps=1e-6) if action_config.qk_norm else nn.Identity()
+        # self.q_norm = WanRMSNorm(head_dim, eps=1e-6) if action_config.qk_norm else nn.Identity()
+        # self.k_norm = WanRMSNorm(head_dim, eps=1e-6) if action_config.qk_norm else nn.Identity()
+        self.q_norm = nn.RMSNorm(head_dim, eps=1e-6) if action_config.qk_norm else nn.Identity()
+        self.k_norm = nn.RMSNorm(head_dim, eps=1e-6) if action_config.qk_norm else nn.Identity()
 
         # Output projection
         self.proj_keyboard = nn.Linear(
