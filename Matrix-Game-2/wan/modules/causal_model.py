@@ -19,7 +19,10 @@ import torch
 import math
 import os
 import torch.distributed as dist
-from typing import Optional, List, Dict
+from typing import Optional, List, Dict, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .flashinfer_attention import FlashInferPlanner
 
 # 允许通过环境变量选择使用模块化版本
 USE_MODULAR_ACTION = os.environ.get("USE_MODULAR_ACTION", "1") == "1"
@@ -110,7 +113,8 @@ class CausalWanSelfAttention(nn.Module):
         block_mask,
         kv_cache=None,
         current_start=0,
-        cache_start=None
+        cache_start=None,
+        planner=None,  # Unused, for API compatibility with FlashInferCausalSelfAttention
     ):
         r"""
         Args:
@@ -119,7 +123,9 @@ class CausalWanSelfAttention(nn.Module):
             grid_sizes(Tensor): Shape [B, 3], the second dimension contains (F, H, W)
             freqs(Tensor): Rope freqs, shape [1024, C / num_heads / 2]
             block_mask (BlockMask)
+            planner: Unused, for API compatibility with FlashInferCausalSelfAttention
         """
+        del planner  # Unused
         b, s, n, d = *x.shape[:2], self.num_heads, self.head_dim
         if cache_start is None:
             cache_start = current_start
@@ -290,7 +296,8 @@ class CausalWanAttentionBlock(nn.Module):
         crossattn_cache: Optional[dict] = None,
         current_start: int = 0,
         cache_start: Optional[int] = None,
-        action_context: Optional[ActionContext] = None
+        action_context: Optional[ActionContext] = None,
+        planner: Optional["FlashInferPlanner"] = None,
     ) -> torch.Tensor:
         r"""
         Forward pass through the attention block.
@@ -331,7 +338,7 @@ class CausalWanAttentionBlock(nn.Module):
             x, shift_msa, scale_msa, gate_msa,
             num_frames, frame_seqlen,
             seq_lens, grid_sizes, freqs, block_mask,
-            kv_cache, current_start, cache_start
+            kv_cache, current_start, cache_start, planner
         )
 
         # ==================== Cross-Attention + Action + FFN Block ====================
@@ -358,7 +365,8 @@ class CausalWanAttentionBlock(nn.Module):
         block_mask,
         kv_cache,
         current_start: int,
-        cache_start
+        cache_start,
+        planner: Optional["FlashInferPlanner"] = None,
     ) -> torch.Tensor:
         """
         Apply AdaLN-modulated self-attention with gated residual.
@@ -373,9 +381,10 @@ class CausalWanAttentionBlock(nn.Module):
             ).flatten(1, 2)
 
             # Self-attention
+            # For FlashInferCausalSelfAttention, pass planner; for original, it's ignored
             y = self.self_attn(
                 x_modulated, seq_lens, grid_sizes, freqs, block_mask,
-                kv_cache, current_start, cache_start
+                kv_cache, current_start, cache_start, planner=planner
             )
 
             # Gated residual
@@ -920,6 +929,24 @@ class CausalWanModel(ModelMixin, ConfigMixin, FromOriginalModelMixin, PeftAdapte
             action_context.use_rope_keyboard = self.use_rope_keyboard
             action_context.num_frame_per_block = self.num_frame_per_block
 
+        # Check if using PagedCache and setup FlashInfer planner if so
+        planner = None
+        first_cache = kv_cache[0] if kv_cache else None
+        is_paged_cache = first_cache is not None and hasattr(first_cache, 'get_flashinfer_meta')
+
+        if is_paged_cache:
+            # Import FlashInferPlanner and create planner for this generation step
+            from .flashinfer_attention import FlashInferPlanner, FLASHINFER_AVAILABLE
+            if FLASHINFER_AVAILABLE:
+                # Create planner with model parameters
+                # head_dim = dim // num_heads (CausalWanModel doesn't store head_dim directly)
+                head_dim = self.dim // self.num_heads
+                planner = FlashInferPlanner(
+                    num_heads=self.num_heads,
+                    head_dim=head_dim,
+                    page_size=first_cache.page_size,
+                )
+
         # arguments
         kwargs = dict(
             ada_params=e0,
@@ -944,11 +971,16 @@ class CausalWanModel(ModelMixin, ConfigMixin, FromOriginalModelMixin, PeftAdapte
                         action_context.kv_cache_mouse = kv_cache_mouse[block_index] if kv_cache_mouse else None
                         action_context.kv_cache_keyboard = kv_cache_keyboard[block_index] if kv_cache_keyboard else None
 
+                    # Note: FlashInfer plan is executed lazily in the first attention layer
+                    # (inside _forward_incremental_paged) after cache is updated.
+                    # All subsequent layers reuse the same plan.
+
                     if torch.is_grad_enabled() and self.gradient_checkpointing:
                         kwargs.update({
                             "kv_cache": kv_cache[block_index],
                             "current_start": current_start,
                             "cache_start": cache_start,
+                            "planner": planner,
                         })
                         x = torch.utils.checkpoint.checkpoint(
                             create_custom_forward(block),
@@ -961,6 +993,7 @@ class CausalWanModel(ModelMixin, ConfigMixin, FromOriginalModelMixin, PeftAdapte
                             "crossattn_cache": crossattn_cache[block_index],
                             "current_start": current_start,
                             "cache_start": cache_start,
+                            "planner": planner,
                         })
                         x = block(x, **kwargs)
 

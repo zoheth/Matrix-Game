@@ -10,19 +10,14 @@ Key features:
 2. Sliding window eviction support
 3. Sink token preservation during eviction
 4. FlashInfer metadata generation for paged attention
+
+Note: FlashInfer plan/run logic is handled by FlashInferPlanner in
+flashinfer_attention.py. This module only provides cache storage.
 """
 
 import math
 from typing import Optional, Tuple
 import torch
-
-try:
-    import flashinfer
-    from flashinfer import BatchPrefillWithPagedKVCacheWrapper
-    FLASHINFER_AVAILABLE = True
-except ImportError:
-    FLASHINFER_AVAILABLE = False
-    flashinfer = None
 
 
 class PagedCache:
@@ -415,6 +410,9 @@ class PagedCacheManager:
 
     This class provides a unified interface for creating and managing
     layer-wise paged caches, compatible with the existing CacheManager API.
+
+    Note: FlashInfer plan/run logic is handled by FlashInferPlanner in
+    flashinfer_attention.py, not here. This class only manages cache storage.
     """
 
     def __init__(
@@ -464,10 +462,6 @@ class PagedCacheManager:
             for _ in range(num_layers)
         ]
 
-        # FlashInfer workspace (shared across layers)
-        self._workspace_buffer: Optional[torch.Tensor] = None
-        self._prefill_wrapper: Optional["BatchPrefillWithPagedKVCacheWrapper"] = None
-
     def reset(self) -> None:
         """Reset all layer caches."""
         for cache in self.caches:
@@ -476,29 +470,6 @@ class PagedCacheManager:
     def get_cache(self, layer_idx: int) -> PagedCache:
         """Get cache for a specific layer."""
         return self.caches[layer_idx]
-
-    def init_flashinfer_wrapper(self, device: torch.device) -> None:
-        """Initialize FlashInfer workspace and wrapper (called once)."""
-        if not FLASHINFER_AVAILABLE:
-            return
-
-        if self._workspace_buffer is None:
-            self._workspace_buffer = torch.empty(
-                128 * 1024 * 1024,  # 128MB workspace
-                dtype=torch.uint8,
-                device=device
-            )
-
-        if self._prefill_wrapper is None:
-            self._prefill_wrapper = BatchPrefillWithPagedKVCacheWrapper(
-                self._workspace_buffer,
-                kv_layout="NHD"  # [num_pages, page_size, num_heads, head_dim]
-            )
-
-    @property
-    def prefill_wrapper(self) -> Optional["BatchPrefillWithPagedKVCacheWrapper"]:
-        """Get the FlashInfer prefill wrapper."""
-        return self._prefill_wrapper
 
     def __len__(self) -> int:
         return self.num_layers

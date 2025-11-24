@@ -9,21 +9,24 @@ Key features:
 2. Applies 3D RoPE BEFORE attention (rope_mode="NONE") for compatibility
 3. All memory pre-allocated for CUDA Graph compatibility
 4. Supports sliding window attention via page eviction
-5. Compatible with both dict-based cache and PagedCache
+5. Plan is executed ONCE per generation step and shared across all layers
+
+Architecture:
+- FlashInferPlanner: Manages plan state, called once per generation step
+- FlashInferCausalSelfAttention: Executes run() using shared plan state
 """
 
-from typing import Dict, Optional, Tuple, Union
+from typing import Optional, TYPE_CHECKING
 import math
 import torch
 import torch.nn as nn
 
 try:
-    import flashinfer
     from flashinfer import BatchPrefillWithPagedKVCacheWrapper
     FLASHINFER_AVAILABLE = True
 except ImportError:
     FLASHINFER_AVAILABLE = False
-    flashinfer = None
+    BatchPrefillWithPagedKVCacheWrapper = None
 
 from wan.modules.attention import attention as flash_attention_fallback
 
@@ -162,21 +165,155 @@ def apply_rope_3d_precomputed(
     return x_out.type_as(x)
 
 
+class FlashInferPlanner:
+    """
+    Manages FlashInfer plan state for a generation step.
+
+    This class is responsible for:
+    1. Initializing FlashInfer workspace buffer and wrapper
+    2. Executing plan() once per generation step
+    3. Providing the planned wrapper to all attention layers
+
+    Usage:
+        planner = FlashInferPlanner(num_heads, head_dim, page_size)
+        planner.init(device, dtype)
+
+        # Once per generation step, after KV cache is updated:
+        planner.plan(kv_cache, q_len)
+
+        # All layers use the same planned wrapper:
+        output = planner.run(q, kv_cache)
+    """
+
+    def __init__(
+        self,
+        num_heads: int,
+        head_dim: int,
+        page_size: int,
+        workspace_size: int = 128 * 1024 * 1024,  # 128MB
+    ):
+        self.num_heads = num_heads
+        self.head_dim = head_dim
+        self.page_size = page_size
+        self.workspace_size = workspace_size
+
+        self._workspace_buffer: Optional[torch.Tensor] = None
+        self._prefill_wrapper: Optional[BatchPrefillWithPagedKVCacheWrapper] = None
+        self._is_planned = False
+
+    def init(self, device: torch.device) -> None:
+        """Initialize FlashInfer workspace and wrapper."""
+        if not FLASHINFER_AVAILABLE:
+            return
+
+        if self._workspace_buffer is None:
+            self._workspace_buffer = torch.empty(
+                self.workspace_size,
+                dtype=torch.uint8,
+                device=device
+            )
+
+        if self._prefill_wrapper is None:
+            self._prefill_wrapper = BatchPrefillWithPagedKVCacheWrapper(
+                self._workspace_buffer,
+                kv_layout="NHD"
+            )
+
+    def plan(
+        self,
+        kv_cache: PagedCache,
+        q_len: int,
+        device: torch.device,
+        q_dtype: torch.dtype,
+    ) -> None:
+        """
+        Execute plan for the current generation step.
+
+        This should be called ONCE per generation step, before any attention layers.
+        All layers will share this plan.
+
+        Args:
+            kv_cache: The PagedCache containing KV data (any layer's cache works,
+                     as they all have the same structure)
+            q_len: Query sequence length
+            device: Device for tensors
+            q_dtype: Query data type
+        """
+        if not FLASHINFER_AVAILABLE:
+            self._is_planned = False
+            return
+
+        self.init(device)
+
+        # Get FlashInfer metadata from cache
+        paged_kv_indices, paged_kv_indptr, paged_kv_last_page_len = kv_cache.get_flashinfer_meta(device)
+
+        # Build qo_indptr for single batch
+        qo_indptr = torch.tensor([0, q_len], dtype=torch.int32, device=device)
+
+        # Plan the paged attention
+        self._prefill_wrapper.plan(
+            qo_indptr=qo_indptr,
+            paged_kv_indptr=paged_kv_indptr,
+            paged_kv_indices=paged_kv_indices,
+            paged_kv_last_page_len=paged_kv_last_page_len,
+            num_qo_heads=self.num_heads,
+            num_kv_heads=self.num_heads,
+            head_dim_qk=self.head_dim,
+            page_size=self.page_size,
+            causal=False,  # Already handled by cache management
+            q_data_type=q_dtype,
+        )
+
+        self._is_planned = True
+
+    def run(
+        self,
+        q: torch.Tensor,  # [q_len, num_heads, head_dim]
+        kv_cache: PagedCache,
+    ) -> torch.Tensor:
+        """
+        Run paged attention using the pre-computed plan.
+
+        Args:
+            q: Query tensor [q_len, num_heads, head_dim]
+            kv_cache: Layer-specific PagedCache
+
+        Returns:
+            Attention output [q_len, num_heads, head_dim]
+        """
+        if not self._is_planned:
+            raise RuntimeError("FlashInferPlanner.plan() must be called before run()")
+
+        return self._prefill_wrapper.run(
+            q,
+            (kv_cache.k_cache, kv_cache.v_cache),
+        )
+
+    @property
+    def is_available(self) -> bool:
+        return FLASHINFER_AVAILABLE
+
+    @property
+    def is_planned(self) -> bool:
+        return self._is_planned
+
+    def reset(self) -> None:
+        """Reset plan state. Call at the start of each generation step if needed."""
+        self._is_planned = False
+
+
 class FlashInferCausalSelfAttention(nn.Module):
     """
     FlashInfer-based causal self-attention with 3D RoPE support.
 
-    This is designed to be a drop-in replacement for CausalWanSelfAttention
-    but uses FlashInfer for attention computation.
+    This module expects plan() to be called externally (via FlashInferPlanner)
+    before forward(). It only executes run() using the pre-computed plan.
 
-    Key differences from CausalWanSelfAttention:
-    1. Uses FlashInfer's paged KV cache instead of rolling buffer
-    2. Precomputes RoPE frequencies for CUDA Graph compatibility
-    3. All memory allocation happens at initialization
-
-    Supports two cache modes:
-    - Dict-based cache: {"k": tensor, "v": tensor, ...} (legacy mode)
-    - PagedCache: Efficient paged memory management for FlashInfer
+    Key design:
+    - plan() is NOT called here - it's called once per generation step by the model
+    - run() uses the shared FlashInferPlanner
+    - This allows all layers to share the same plan, avoiding redundant computation
     """
 
     def __init__(
@@ -188,26 +325,11 @@ class FlashInferCausalSelfAttention(nn.Module):
         qk_norm: bool = True,
         eps: float = 1e-6,
         # FlashInfer specific
-        max_frames: int = 1024,  # Now memory-efficient with on-demand computation
+        max_frames: int = 1024,
         height: int = 22,
         width: int = 40,
         page_size: int = 16,
     ):
-        """
-        Initialize FlashInfer-based self-attention.
-
-        Args:
-            dim: Hidden dimension
-            num_heads: Number of attention heads
-            local_attn_size: Sliding window size in frames (-1 for full attention)
-            sink_size: Number of sink frames to keep
-            qk_norm: Whether to apply QK normalization
-            eps: Epsilon for normalization
-            max_frames: Maximum frames to support
-            height: Spatial height after patchification
-            width: Spatial width after patchification
-            page_size: Page size for KV cache
-        """
         super().__init__()
 
         assert dim % num_heads == 0
@@ -243,12 +365,6 @@ class FlashInferCausalSelfAttention(nn.Module):
         # RoPE cache (initialized lazily on first forward)
         self.rope_cache: Optional[PrecomputedRoPE3DCache] = None
 
-        # FlashInfer workspace (initialized lazily)
-        self._workspace_buffer: Optional[torch.Tensor] = None
-        self._prefill_wrapper: Optional[BatchPrefillWithPagedKVCacheWrapper] = None
-
-
-
     def _init_rope_cache(self, freqs: torch.Tensor):
         """Initialize precomputed RoPE frequencies."""
         if self.rope_cache is None:
@@ -260,24 +376,6 @@ class FlashInferCausalSelfAttention(nn.Module):
                 device=freqs.device,
             )
 
-    def _init_flashinfer(self, device: torch.device, dtype: torch.dtype):
-        """Initialize FlashInfer workspace and wrapper."""
-        if not FLASHINFER_AVAILABLE:
-            return
-
-        if self._workspace_buffer is None:
-            self._workspace_buffer = torch.empty(
-                128 * 1024 * 1024,  # 128MB workspace
-                dtype=torch.uint8,
-                device=device
-            )
-
-        if self._prefill_wrapper is None:
-            self._prefill_wrapper = BatchPrefillWithPagedKVCacheWrapper(
-                self._workspace_buffer,
-                kv_layout="NHD"
-            )
-
     def forward(
         self,
         x: torch.Tensor,  # [B, seq_len, dim]
@@ -285,33 +383,30 @@ class FlashInferCausalSelfAttention(nn.Module):
         grid_sizes: torch.Tensor,  # [3] = (F, H, W)
         freqs: torch.Tensor,  # [1024, head_dim//2]
         block_mask,  # BlockMask (unused with FlashInfer)
-        kv_cache: Optional[Union[Dict[str, torch.Tensor], PagedCache]] = None,
+        kv_cache: Optional[PagedCache] = None,
         current_start: int = 0,
-        cache_start: Optional[int] = None,
+        cache_start: Optional[int] = None,  # Unused, for API compatibility
+        planner: Optional[FlashInferPlanner] = None,
     ) -> torch.Tensor:
         """
         Forward pass with FlashInfer attention.
-
-        When kv_cache is None: Full attention (training/first frame)
-        When kv_cache is provided: Incremental attention with KV cache
 
         Args:
             x: Input hidden states [B, seq_len, dim]
             seq_lens: Sequence lengths [B]
             grid_sizes: [F, H, W] grid dimensions
             freqs: RoPE frequencies [1024, head_dim//2]
-            block_mask: Attention mask (unused with FlashInfer)
-            kv_cache: KV cache (dict or PagedCache)
+            block_mask: Attention mask (for full attention path only)
+            kv_cache: PagedCache for incremental attention
             current_start: Current position in sequence
-            cache_start: Start position of cache
+            cache_start: Unused, for API compatibility with CausalWanSelfAttention
+            planner: FlashInferPlanner with pre-computed plan (required for incremental)
 
         Returns:
             Output hidden states [B, seq_len, dim]
         """
+        del seq_lens, cache_start  # Unused
         b, s, n, d = *x.shape[:2], self.num_heads, self.head_dim
-
-        if cache_start is None:
-            cache_start = current_start
 
         # Compute Q, K, V
         q = self.norm_q(self.q(x)).view(b, s, n, d)
@@ -320,24 +415,16 @@ class FlashInferCausalSelfAttention(nn.Module):
 
         if kv_cache is None:
             # Full attention path (training or first frame)
-            # Use standard flash attention
-            return self._forward_full_attention(
-                q, k, v, grid_sizes, freqs, block_mask
-            )
-        elif isinstance(kv_cache, PagedCache):
-            # PagedCache path - use FlashInfer paged attention
-            return self._forward_incremental_paged(
-                q, k, v, grid_sizes, freqs, kv_cache, current_start
-            )
+            return self._forward_full_attention(q, k, v, grid_sizes, freqs, block_mask)
         else:
-            # Dict-based cache path (legacy mode)
-            return self._forward_incremental(
-                q, k, v, grid_sizes, freqs, kv_cache, current_start, cache_start
+            # Incremental attention with PagedCache
+            return self._forward_incremental_paged(
+                q, k, v, grid_sizes, freqs, kv_cache, current_start, planner
             )
 
     def _forward_full_attention(
         self,
-        q: torch.Tensor,  # [B, seq_len, num_heads, head_dim]
+        q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
         grid_sizes: torch.Tensor,
@@ -381,18 +468,19 @@ class FlashInferCausalSelfAttention(nn.Module):
 
     def _forward_incremental_paged(
         self,
-        q: torch.Tensor,  # [B, seq_len, num_heads, head_dim]
+        q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
-        grid_sizes: torch.Tensor,  # [3] = (F, H, W) for current frame
+        grid_sizes: torch.Tensor,
         freqs: torch.Tensor,
         kv_cache: PagedCache,
         current_start: int,
+        planner: Optional[FlashInferPlanner],
     ) -> torch.Tensor:
         """
         Incremental attention with PagedCache using FlashInfer.
 
-        This is the optimized path using FlashInfer's paged attention.
+        Uses pre-computed plan from FlashInferPlanner.
         """
         assert grid_sizes.ndim == 1
         B = q.shape[0]
@@ -416,65 +504,38 @@ class FlashInferCausalSelfAttention(nn.Module):
         roped_k = apply_rope_3d_precomputed(k, precomputed_freqs)
 
         # Squeeze batch dimension for PagedCache (batch=1)
-        # PagedCache expects [seq_len, num_heads, head_dim]
         roped_k_squeezed = roped_k.squeeze(0)  # [seq_len, num_heads, head_dim]
-        v_squeezed = v.squeeze(0)  # [seq_len, num_heads, head_dim]
+        v_squeezed = v.squeeze(0)
 
         # Calculate current_end for update_or_append
         current_end = current_start + roped_k_squeezed.shape[0]
 
-        # Use update_or_append to handle denoising (overwrite) vs new frame (append)
-        # This is critical: during denoising, multiple forward passes happen for
-        # the same position, and we should overwrite rather than append
+        # Update cache: handle denoising (overwrite) vs new frame (append)
         kv_cache.update_or_append(roped_k_squeezed, v_squeezed, current_start, current_end)
 
         # Evict old pages if needed (sliding window)
         kv_cache.evict(self.max_attention_size)
 
         # Compute attention
-        if FLASHINFER_AVAILABLE:
-            # Initialize FlashInfer wrapper
-            self._init_flashinfer(q.device, q.dtype)
+        if planner is not None and planner.is_available:
+            # Plan if not already planned (first layer does this, subsequent layers skip)
+            # All layers have the same cache structure, so plan is reusable
+            if not planner.is_planned:
+                planner.plan(
+                    kv_cache=kv_cache,
+                    q_len=roped_q.shape[1],
+                    device=roped_q.device,
+                    q_dtype=roped_q.dtype,
+                )
 
-            # Get FlashInfer metadata
-            paged_kv_indices, paged_kv_indptr, paged_kv_last_page_len = kv_cache.get_flashinfer_meta(q.device)
-
-            # Build qo_indptr for single batch
-            q_len = roped_q.shape[1]
-            qo_indptr = torch.tensor([0, q_len], dtype=torch.int32, device=q.device)
-
-            # Plan the paged attention using FlashInfer's plan() API
-            self._prefill_wrapper.plan(
-                qo_indptr=qo_indptr,
-                paged_kv_indptr=paged_kv_indptr,
-                paged_kv_indices=paged_kv_indices,
-                paged_kv_last_page_len=paged_kv_last_page_len,
-                num_qo_heads=self.num_heads,
-                num_kv_heads=self.num_heads,
-                head_dim_qk=self.head_dim,
-                page_size=kv_cache.page_size,
-                causal=False,  # Already handled by cache management
-                q_data_type=roped_q.dtype,
-            )
-
-            # Run paged attention
-            # q: [B, q_len, num_heads, head_dim] -> [q_len, num_heads, head_dim]
-            q_for_flash = roped_q.squeeze(0)
-
-            # FlashInfer expects paged_kv_cache as tuple (k_cache, v_cache)
-            # k_cache/v_cache shape: [max_pages, page_size, num_heads, head_dim]
-            x = self._prefill_wrapper.run(
-                q_for_flash,
-                (kv_cache.k_cache, kv_cache.v_cache),
-            )
-
-            # Reshape back to [B, seq_len, num_heads, head_dim]
-            x = x.unsqueeze(0)
+            # Use FlashInfer with pre-computed plan
+            q_for_flash = roped_q.squeeze(0)  # [q_len, num_heads, head_dim]
+            x = planner.run(q_for_flash, kv_cache)
+            x = x.unsqueeze(0)  # [1, q_len, num_heads, head_dim]
         else:
             # Fallback: get contiguous K/V and use standard attention
             k_contiguous, v_contiguous = kv_cache.get_kv_for_attention()
-            # Add batch dimension back
-            k_contiguous = k_contiguous.unsqueeze(0)  # [1, kv_len, num_heads, head_dim]
+            k_contiguous = k_contiguous.unsqueeze(0)
             v_contiguous = v_contiguous.unsqueeze(0)
             x = flash_attention_fallback(roped_q, k_contiguous, v_contiguous)
 
@@ -482,141 +543,6 @@ class FlashInferCausalSelfAttention(nn.Module):
         x = x.flatten(2)
         x = self.o(x)
         return x
-
-    def _forward_incremental(
-        self,
-        q: torch.Tensor,  # [B, seq_len, num_heads, head_dim]
-        k: torch.Tensor,
-        v: torch.Tensor,
-        grid_sizes: torch.Tensor,  # [3] = (F, H, W) for current frame
-        freqs: torch.Tensor,
-        kv_cache: Dict[str, torch.Tensor],
-        current_start: int,
-        cache_start: int,
-    ) -> torch.Tensor:
-        """
-        Incremental attention with dict-based KV cache (legacy mode).
-
-        This preserves compatibility with existing code that uses dict-based caches.
-        """
-        assert grid_sizes.ndim == 1
-
-        # Initialize RoPE cache if needed
-        self._init_rope_cache(freqs)
-
-        # Calculate frame position
-        frame_seqlen = math.prod(grid_sizes[1:]).item()
-        current_start_frame = current_start // frame_seqlen
-        num_frames = grid_sizes[0].item()
-
-        # Get precomputed frequencies for this frame range
-        precomputed_freqs = self.rope_cache.get_freqs_for_frame_range(
-            current_start_frame, num_frames
-        )
-
-        # Apply 3D RoPE using precomputed frequencies
-        roped_q = apply_rope_3d_precomputed(q, precomputed_freqs)
-        roped_k = apply_rope_3d_precomputed(k, precomputed_freqs)
-
-        # Update KV cache
-        current_end = current_start + roped_q.shape[1]
-        sink_tokens = self.sink_size * frame_seqlen
-        kv_cache_size = kv_cache["k"].shape[1]
-        num_new_tokens = roped_q.shape[1]
-
-        # Check if eviction is needed
-        if (current_end > kv_cache["global_end_index"].item()) and (
-                num_new_tokens + kv_cache["local_end_index"].item() > kv_cache_size):
-            # Eviction logic (same as original)
-            num_evicted_tokens = num_new_tokens + kv_cache["local_end_index"].item() - kv_cache_size
-            num_rolled_tokens = kv_cache["local_end_index"].item() - num_evicted_tokens - sink_tokens
-
-            # Roll the cache
-            kv_cache["k"][:, sink_tokens:sink_tokens + num_rolled_tokens] = \
-                kv_cache["k"][:, sink_tokens + num_evicted_tokens:sink_tokens + num_evicted_tokens + num_rolled_tokens].clone()
-            kv_cache["v"][:, sink_tokens:sink_tokens + num_rolled_tokens] = \
-                kv_cache["v"][:, sink_tokens + num_evicted_tokens:sink_tokens + num_evicted_tokens + num_rolled_tokens].clone()
-
-            local_end_index = kv_cache["local_end_index"].item() + current_end - \
-                kv_cache["global_end_index"].item() - num_evicted_tokens
-            local_start_index = local_end_index - num_new_tokens
-        else:
-            local_end_index = kv_cache["local_end_index"].item() + current_end - kv_cache["global_end_index"].item()
-            local_start_index = local_end_index - num_new_tokens
-
-        # Insert new K/V
-        kv_cache["k"][:, local_start_index:local_end_index] = roped_k
-        kv_cache["v"][:, local_start_index:local_end_index] = v
-
-        # Compute attention using FlashInfer or fallback
-        window_start = max(0, local_end_index - self.max_attention_size)
-        k_window = kv_cache["k"][:, window_start:local_end_index]
-        v_window = kv_cache["v"][:, window_start:local_end_index]
-
-        if FLASHINFER_AVAILABLE:
-            # Use FlashInfer for attention
-            self._init_flashinfer(roped_q.device, roped_q.dtype)
-            x = self._flashinfer_attention(roped_q, k_window, v_window)
-        else:
-            # Fallback to standard flash attention
-            x = flash_attention_fallback(roped_q, k_window, v_window)
-
-        # Update cache indices
-        kv_cache["global_end_index"].fill_(current_end)
-        kv_cache["local_end_index"].fill_(local_end_index)
-
-        # Output projection
-        x = x.flatten(2)
-        x = self.o(x)
-        return x
-
-    def _flashinfer_attention(
-        self,
-        q: torch.Tensor,  # [B, q_len, num_heads, head_dim]
-        k: torch.Tensor,  # [B, kv_len, num_heads, head_dim]
-        v: torch.Tensor,  # [B, kv_len, num_heads, head_dim]
-    ) -> torch.Tensor:
-        """Compute attention using FlashInfer (non-paged, for dict cache)."""
-        B, q_len, num_heads, head_dim = q.shape
-        _, kv_len, _, _ = k.shape
-
-        if B == 1:
-            # Single sequence - use single_prefill_with_kv_cache
-            output = flashinfer.single_prefill_with_kv_cache(
-                q.squeeze(0),  # [q_len, num_heads, head_dim]
-                k.squeeze(0),  # [kv_len, num_heads, head_dim]
-                v.squeeze(0),  # [kv_len, num_heads, head_dim]
-                causal=False,  # Already handled by cache windowing
-            )
-            output = output.unsqueeze(0)  # [1, q_len, num_heads, head_dim]
-        else:
-            # Batch attention using BatchPrefillWithRaggedKVCacheWrapper
-            q_ragged = q.reshape(-1, num_heads, head_dim)
-            k_ragged = k.reshape(-1, num_heads, head_dim)
-            v_ragged = v.reshape(-1, num_heads, head_dim)
-
-            qo_indptr = torch.arange(0, (B + 1) * q_len, q_len, dtype=torch.int32, device=q.device)
-            kv_indptr = torch.arange(0, (B + 1) * kv_len, kv_len, dtype=torch.int32, device=k.device)
-
-            if self._workspace_buffer is None:
-                self._workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=q.device)
-
-            wrapper = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
-                self._workspace_buffer, kv_layout="NHD"
-            )
-
-            wrapper.plan(
-                qo_indptr, kv_indptr,
-                num_heads, num_heads, head_dim,
-                causal=False,
-                q_data_type=q.dtype,
-                kv_data_type=k.dtype,
-            )
-
-            output = wrapper.run(q_ragged, k_ragged, v_ragged)
-            output = output.reshape(B, q_len, num_heads, head_dim)
-
-        return output
 
 
 def replace_attention_with_flashinfer(model: nn.Module) -> nn.Module:
