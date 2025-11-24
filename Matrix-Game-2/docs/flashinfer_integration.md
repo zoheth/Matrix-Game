@@ -52,29 +52,47 @@ The integration addresses three key challenges:
 
 ## Usage
 
-### Basic Usage
+### Command Line Usage
+
+```bash
+# Basic inference (no optimizations)
+python inference.py --img_path demo_images/universal/0000.png
+
+# With FlashInfer enabled
+python inference.py --flashinfer_mode enabled --img_path demo_images/universal/0000.png
+
+# With CUDA Graph enabled (captures GPU operations for replay)
+python inference.py --use_cuda_graph --img_path demo_images/universal/0000.png
+
+# With warmup (for accurate timing)
+python inference.py --warmup --img_path demo_images/universal/0000.png
+
+# Maximum performance (FlashInfer + CUDA Graph + Warmup)
+python inference.py --flashinfer_mode enabled --use_cuda_graph --warmup --img_path demo_images/universal/0000.png
+```
+
+### Python API Usage
 
 ```python
-from pipeline.flashinfer_inference import FlashInferInferencePipeline
+from pipeline import BatchCausalInferencePipeline, PipelineConfig
 
-# Initialize pipeline
-pipeline = FlashInferInferencePipeline(
-    args=config,
+# Initialize pipeline with CUDA Graph
+pipeline = BatchCausalInferencePipeline(
+    config=pipeline_config,
+    generator=generator,
+    vae_decoder=vae_decoder,
     device="cuda",
-    use_flashinfer_attention=True,  # Replace attention with FlashInfer
-    use_cuda_graph=False,           # CUDA Graph (optional)
+    use_cuda_graph=True,  # Enable CUDA Graph
 )
 
 # Run inference
 videos = pipeline.inference(
     noise=noise_tensor,
     conditional_dict=conditions,
-    initial_latent=initial_frame,
-    mode='universal',
 )
 ```
 
-### With CUDA Graph (Maximum Performance)
+### Legacy FlashInferInferencePipeline
 
 ```python
 from pipeline.flashinfer_inference import FlashInferInferencePipeline
@@ -162,19 +180,37 @@ if new_len > max_tokens:
     self._evict_tokens(batch_idx, tokens_to_evict, layer_idx)
 ```
 
-### 4. CUDA Graph Compatibility
+### 4. CUDA Graph Integration
 
-All dynamic allocations moved to initialization:
+CUDA Graph captures GPU operations and replays them without CPU overhead:
 
 ```python
-class FlashInferCausalSelfAttention:
-    def __init__(self, ...):
-        # Pre-allocate workspace
-        self._workspace_buffer = torch.empty(128 * 1024 * 1024, ...)
+class CUDAGraphSingleStepRunner:
+    """Captures a single model forward pass for replay."""
 
-        # Pre-allocate RoPE cache
-        self.rope_cache = PrecomputedRoPE3DCache(...)
+    def capture(self, noisy_input, timestep, conditional_dict, ...):
+        # Warmup iterations
+        for _ in range(3):
+            _ = self.generator(...)
+
+        # Capture graph
+        self.graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(self.graph):
+            flow_pred, aux = self.generator(...)
+
+    def run(self, noisy_input, timestep):
+        # Update static inputs in-place
+        self._static_noisy_input.copy_(noisy_input)
+        self._static_timestep.copy_(timestep)
+        # Replay captured operations
+        self.graph.replay()
+        return self._static_flow_pred, self._static_aux
 ```
+
+Key implementation details:
+- **First block only**: Currently captures graph for `current_start=0` to avoid recapture overhead
+- **Static tensors**: All inputs/outputs are pre-allocated and updated in-place
+- **Warmup required**: First iteration includes capture overhead; use `--warmup` for accurate timing
 
 ## Performance Considerations
 

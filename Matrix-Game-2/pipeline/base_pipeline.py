@@ -18,6 +18,7 @@ from pipeline.cache_manager import CacheManager
 from pipeline.condition_processor import ConditionProcessor
 from demo_utils.constant import ZERO_VAE_CACHE
 from utils.scheduler import FlowMatchingScheduler
+from wan.modules.cuda_graph_inference import CUDAGraphSingleStepRunner
 
 
 class BaseCausalInferencePipeline(torch.nn.Module, ABC):
@@ -38,7 +39,10 @@ class BaseCausalInferencePipeline(torch.nn.Module, ABC):
         config: PipelineConfig,
         generator,
         vae_decoder,
-        device: str = "cuda"
+        device: str = "cuda",
+        use_cuda_graph: bool = False,
+        use_paged_cache: bool = False,
+        page_size: int = 16,
     ):
         """
         Initialize the base pipeline.
@@ -48,6 +52,9 @@ class BaseCausalInferencePipeline(torch.nn.Module, ABC):
             generator: WanDiffusionWrapper instance
             vae_decoder: VAE decoder wrapper
             device: Device to run on
+            use_cuda_graph: Whether to use CUDA Graph for inference
+            use_paged_cache: Whether to use PagedCache for FlashInfer optimization
+            page_size: Page size for PagedCache (only used if use_paged_cache=True)
         """
         super().__init__()
 
@@ -55,6 +62,13 @@ class BaseCausalInferencePipeline(torch.nn.Module, ABC):
         self.device = torch.device(device)
         self.generator = generator
         self.vae_decoder = vae_decoder
+        self.use_cuda_graph = use_cuda_graph
+        self.use_paged_cache = use_paged_cache
+        self.page_size = page_size
+
+        # CUDA Graph runner (lazy initialization)
+        self._cuda_graph_runner: Optional[CUDAGraphSingleStepRunner] = None
+        self._cuda_graph_captured_start: Optional[int] = None
 
         # Pipeline owns the scheduler (not generator)
         self.scheduler = FlowMatchingScheduler(
@@ -99,7 +113,9 @@ class BaseCausalInferencePipeline(torch.nn.Module, ABC):
                 model_config=self.config.model,
                 cache_config=self.config.cache,
                 device=self.device,
-                dtype=dtype
+                dtype=dtype,
+                use_paged_cache=self.use_paged_cache,
+                page_size=self.page_size,
             )
             self.cache_manager.initialize_all_caches(batch_size)
         elif not self.cache_manager.is_initialized():
@@ -206,6 +222,17 @@ class BaseCausalInferencePipeline(torch.nn.Module, ABC):
         """
         current_num_frames = noisy_input.shape[2]
         visual_cache, mouse_cache, keyboard_cache, crossattn_cache = self.cache_manager.get_caches()
+        current_start = current_start_frame * self.config.model.frame_seq_length
+
+        # Initialize CUDA Graph if enabled and not yet captured for this start position
+        use_graph = self.use_cuda_graph and self._should_use_cuda_graph(current_start)
+
+        if use_graph and self._cuda_graph_runner is None:
+            self._cuda_graph_runner = CUDAGraphSingleStepRunner(
+                generator=self.generator,
+                device=self.device,
+                dtype=noisy_input.dtype,
+            )
 
         for index, current_timestep in enumerate(self.denoising_step_list):
             # Set timestep
@@ -215,17 +242,29 @@ class BaseCausalInferencePipeline(torch.nn.Module, ABC):
                 dtype=torch.int64
             ) * current_timestep
 
-            # Forward pass - generator now returns flow_pred, flow_pred (no longer x0)
-            flow_pred, _ = self.generator(
-                noisy_image_or_video=noisy_input,
-                conditional_dict=conditional_dict,
-                timestep=timestep,
-                kv_cache=visual_cache,
-                kv_cache_mouse=mouse_cache,
-                kv_cache_keyboard=keyboard_cache,
-                crossattn_cache=crossattn_cache,
-                current_start=current_start_frame * self.config.model.frame_seq_length
-            )
+            # Forward pass - use CUDA Graph if available
+            if use_graph:
+                flow_pred, _ = self._run_with_cuda_graph(
+                    noisy_input=noisy_input,
+                    timestep=timestep,
+                    conditional_dict=conditional_dict,
+                    visual_cache=visual_cache,
+                    mouse_cache=mouse_cache,
+                    keyboard_cache=keyboard_cache,
+                    crossattn_cache=crossattn_cache,
+                    current_start=current_start,
+                )
+            else:
+                flow_pred, _ = self.generator(
+                    noisy_image_or_video=noisy_input,
+                    conditional_dict=conditional_dict,
+                    timestep=timestep,
+                    kv_cache=visual_cache,
+                    kv_cache_mouse=mouse_cache,
+                    kv_cache_keyboard=keyboard_cache,
+                    crossattn_cache=crossattn_cache,
+                    current_start=current_start,
+                )
 
             # Convert flow prediction to x0 using scheduler
             denoised_pred = self.scheduler.convert_flow_to_x0(
@@ -250,6 +289,52 @@ class BaseCausalInferencePipeline(torch.nn.Module, ABC):
                 noisy_input = rearrange(noisy_input, '(b f) c h w -> b c f h w', b=batch_size)
 
         return denoised_pred
+
+    def _should_use_cuda_graph(self, current_start: int) -> bool:
+        """
+        Determine if CUDA Graph should be used for this forward pass.
+
+        CUDA Graph requires static current_start. We capture once and reuse
+        only when current_start matches the captured value.
+
+        For simplicity, we only use CUDA Graph when current_start == 0
+        (first block of each inference). This covers the warmup case well.
+        """
+        # For now, only use graph for first block to avoid recapture complexity
+        return current_start == 0
+
+    def _run_with_cuda_graph(
+        self,
+        noisy_input: torch.Tensor,
+        timestep: torch.Tensor,
+        conditional_dict: Dict[str, torch.Tensor],
+        visual_cache: List[Dict],
+        mouse_cache: List[Dict],
+        keyboard_cache: List[Dict],
+        crossattn_cache: List[Dict],
+        current_start: int,
+    ):
+        """Run forward pass using CUDA Graph."""
+        runner = self._cuda_graph_runner
+
+        # Capture graph if not yet captured for this current_start
+        if not runner.is_captured or self._cuda_graph_captured_start != current_start:
+            if runner.is_captured:
+                runner.reset()
+            runner.capture(
+                noisy_input=noisy_input,
+                timestep=timestep,
+                conditional_dict=conditional_dict,
+                kv_cache=visual_cache,
+                kv_cache_mouse=mouse_cache,
+                kv_cache_keyboard=keyboard_cache,
+                crossattn_cache=crossattn_cache,
+                current_start=current_start,
+            )
+            self._cuda_graph_captured_start = current_start
+
+        # Run using graph
+        return runner.run(noisy_input, timestep, conditional_dict)
 
     def _update_kv_cache_with_clean_context(
         self,

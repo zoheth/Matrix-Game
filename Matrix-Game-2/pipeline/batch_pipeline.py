@@ -30,7 +30,10 @@ class BatchCausalInferencePipeline(BaseCausalInferencePipeline):
         config: PipelineConfig,
         generator,
         vae_decoder,
-        device: str = "cuda"
+        device: str = "cuda",
+        use_cuda_graph: bool = False,
+        use_paged_cache: bool = False,
+        page_size: int = 16,
     ):
         """
         Initialize batch inference pipeline.
@@ -40,8 +43,14 @@ class BatchCausalInferencePipeline(BaseCausalInferencePipeline):
             generator: WanDiffusionWrapper instance
             vae_decoder: VAE decoder wrapper
             device: Device to run on
+            use_cuda_graph: Whether to use CUDA Graph for inference
+            use_paged_cache: Whether to use PagedCache for FlashInfer optimization
+            page_size: Page size for PagedCache (only used if use_paged_cache=True)
         """
-        super().__init__(config, generator, vae_decoder, device)
+        super().__init__(
+            config, generator, vae_decoder, device, use_cuda_graph,
+            use_paged_cache=use_paged_cache, page_size=page_size
+        )
 
     def inference(
         self,

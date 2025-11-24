@@ -47,6 +47,12 @@ def parse_args():
                         help="FlashInfer mode: disabled (original), validate (compare both), enabled (use FlashInfer)")
     parser.add_argument("--warmup", action="store_true",
                         help="Run a warmup iteration before timing (triggers JIT compilation)")
+    parser.add_argument("--use_cuda_graph", action="store_true",
+                        help="Use CUDA Graph for inference (captures and replays GPU operations)")
+    parser.add_argument("--use_paged_cache", action="store_true",
+                        help="Use PagedCache for FlashInfer paged attention optimization")
+    parser.add_argument("--page_size", type=int, default=16,
+                        help="Page size for PagedCache (default: 16)")
     args = parser.parse_args()
     return args
 
@@ -103,7 +109,10 @@ class InteractiveGameInference:
             config=pipeline_config,
             generator=generator,
             vae_decoder=current_vae_decoder,
-            device="cuda"
+            device="cuda",
+            use_cuda_graph=self.args.use_cuda_graph,
+            use_paged_cache=self.args.use_paged_cache,
+            page_size=self.args.page_size,
         ).to(device=self.device, dtype=self.weight_dtype)
 
         self.pipeline.vae_decoder.to(torch.float16)
@@ -279,15 +288,19 @@ def main():
     set_seed(args.seed)
     os.makedirs(args.output_folder, exist_ok=True)
 
-    # Print FlashInfer status
+    # Print optimization status
     available, version_info = check_flashinfer_available()
     print(f"\n{'='*60}")
-    print(f"FlashInfer Status")
+    print(f"Optimization Status")
     print(f"{'='*60}")
-    print(f"  Available: {available}")
+    print(f"  FlashInfer Available: {available}")
     if available:
-        print(f"  Version: {version_info}")
-    print(f"  Mode: {args.flashinfer_mode.upper()}")
+        print(f"  FlashInfer Version: {version_info}")
+    print(f"  FlashInfer Mode: {args.flashinfer_mode.upper()}")
+    print(f"  Paged Cache: {'ENABLED' if args.use_paged_cache else 'DISABLED'}")
+    if args.use_paged_cache:
+        print(f"  Page Size: {args.page_size}")
+    print(f"  CUDA Graph: {'ENABLED' if args.use_cuda_graph else 'DISABLED'}")
     print(f"{'='*60}\n")
 
     pipeline = InteractiveGameInference(args)

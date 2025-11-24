@@ -421,6 +421,199 @@ class CUDAGraphCausalInference:
         return outputs.get("output_0"), outputs.get("output_1")
 
 
+class CUDAGraphSingleStepRunner:
+    """
+    CUDA Graph runner optimized for single forward pass capture.
+
+    This captures ONE model forward pass and replays it for each denoising step.
+    The graph is captured once and reused by updating input tensors in-place.
+
+    Key design:
+    - Captures model(x, t, cond, ...) -> (flow_pred, aux)
+    - Uses static pre-allocated tensors for all inputs/outputs
+    - current_start is embedded in the graph (requires re-capture if changed)
+    """
+
+    def __init__(
+        self,
+        generator: nn.Module,
+        device: torch.device,
+        dtype: torch.dtype = torch.bfloat16,
+        warmup_iterations: int = 3,
+    ):
+        self.generator = generator
+        self.device = device
+        self.dtype = dtype
+        self.warmup_iterations = warmup_iterations
+
+        # Graph state
+        self.graph: Optional[torch.cuda.CUDAGraph] = None
+        self.stream = torch.cuda.Stream()
+        self.is_captured = False
+
+        # Static tensors (allocated during capture)
+        self._static_noisy_input: Optional[torch.Tensor] = None
+        self._static_timestep: Optional[torch.Tensor] = None
+        self._static_cond_concat: Optional[torch.Tensor] = None
+        self._static_visual_context: Optional[torch.Tensor] = None
+        self._static_mouse_cond: Optional[torch.Tensor] = None
+        self._static_keyboard_cond: Optional[torch.Tensor] = None
+
+        # Output tensors (references after capture)
+        self._static_flow_pred: Optional[torch.Tensor] = None
+        self._static_aux: Optional[torch.Tensor] = None
+
+        # Cached values
+        self._captured_current_start: Optional[int] = None
+        self._kv_caches: Optional[Tuple] = None
+
+    def capture(
+        self,
+        noisy_input: torch.Tensor,
+        timestep: torch.Tensor,
+        conditional_dict: Dict[str, torch.Tensor],
+        kv_cache: List[Dict],
+        kv_cache_mouse: List[Dict],
+        kv_cache_keyboard: List[Dict],
+        crossattn_cache: List[Dict],
+        current_start: int,
+    ) -> None:
+        """
+        Capture a CUDA Graph for the generator forward pass.
+
+        Args:
+            noisy_input: Sample noisy input [B, C, F, H, W]
+            timestep: Sample timestep [B, F]
+            conditional_dict: Conditioning dictionary
+            kv_cache: KV cache (will be bound to graph)
+            kv_cache_mouse: Mouse KV cache
+            kv_cache_keyboard: Keyboard KV cache
+            crossattn_cache: Cross-attention cache
+            current_start: Token start position (embedded in graph)
+        """
+        if self.is_captured:
+            print("[WARNING] Graph already captured. Use reset() to recapture.")
+            return
+
+        print(f"[INFO] Capturing CUDA Graph for current_start={current_start}...")
+
+        # Allocate static input tensors
+        self._static_noisy_input = noisy_input.clone()
+        self._static_timestep = timestep.clone()
+        self._static_cond_concat = conditional_dict["cond_concat"].clone()
+        self._static_visual_context = conditional_dict["visual_context"].clone()
+
+        if "mouse_cond" in conditional_dict:
+            self._static_mouse_cond = conditional_dict["mouse_cond"].clone()
+        if "keyboard_cond" in conditional_dict:
+            self._static_keyboard_cond = conditional_dict["keyboard_cond"].clone()
+
+        # Store cache references and current_start
+        self._kv_caches = (kv_cache, kv_cache_mouse, kv_cache_keyboard, crossattn_cache)
+        self._captured_current_start = current_start
+
+        # Build static conditional dict
+        static_cond = {
+            "cond_concat": self._static_cond_concat,
+            "visual_context": self._static_visual_context,
+        }
+        if self._static_mouse_cond is not None:
+            static_cond["mouse_cond"] = self._static_mouse_cond
+        if self._static_keyboard_cond is not None:
+            static_cond["keyboard_cond"] = self._static_keyboard_cond
+
+        # Warmup iterations
+        torch.cuda.synchronize()
+        with torch.cuda.stream(self.stream):
+            for _ in range(self.warmup_iterations):
+                _ = self.generator(
+                    noisy_image_or_video=self._static_noisy_input,
+                    conditional_dict=static_cond,
+                    timestep=self._static_timestep,
+                    kv_cache=kv_cache,
+                    kv_cache_mouse=kv_cache_mouse,
+                    kv_cache_keyboard=kv_cache_keyboard,
+                    crossattn_cache=crossattn_cache,
+                    current_start=current_start,
+                )
+        torch.cuda.synchronize()
+
+        # Capture graph
+        self.graph = torch.cuda.CUDAGraph()
+
+        with torch.cuda.stream(self.stream):
+            with torch.cuda.graph(self.graph, stream=self.stream):
+                flow_pred, aux = self.generator(
+                    noisy_image_or_video=self._static_noisy_input,
+                    conditional_dict=static_cond,
+                    timestep=self._static_timestep,
+                    kv_cache=kv_cache,
+                    kv_cache_mouse=kv_cache_mouse,
+                    kv_cache_keyboard=kv_cache_keyboard,
+                    crossattn_cache=crossattn_cache,
+                    current_start=current_start,
+                )
+
+        # Store output references
+        self._static_flow_pred = flow_pred
+        self._static_aux = aux
+
+        self.is_captured = True
+        print(f"[INFO] CUDA Graph captured successfully")
+
+    def run(
+        self,
+        noisy_input: torch.Tensor,
+        timestep: torch.Tensor,
+        conditional_dict: Optional[Dict[str, torch.Tensor]] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Run the captured graph with new inputs.
+
+        Args:
+            noisy_input: New noisy input (copied to static tensor)
+            timestep: New timestep (copied to static tensor)
+            conditional_dict: Optional new conditions (usually static)
+
+        Returns:
+            Tuple of (flow_pred, aux) from static output tensors
+        """
+        if not self.is_captured:
+            raise RuntimeError("Graph not captured. Call capture() first.")
+
+        # Update input tensors in-place
+        self._static_noisy_input.copy_(noisy_input)
+        self._static_timestep.copy_(timestep)
+
+        if conditional_dict is not None:
+            self._static_cond_concat.copy_(conditional_dict["cond_concat"])
+            self._static_visual_context.copy_(conditional_dict["visual_context"])
+            if "mouse_cond" in conditional_dict and self._static_mouse_cond is not None:
+                self._static_mouse_cond.copy_(conditional_dict["mouse_cond"])
+            if "keyboard_cond" in conditional_dict and self._static_keyboard_cond is not None:
+                self._static_keyboard_cond.copy_(conditional_dict["keyboard_cond"])
+
+        # Replay graph
+        self.graph.replay()
+
+        return self._static_flow_pred, self._static_aux
+
+    def reset(self) -> None:
+        """Reset the graph for recapture."""
+        self.graph = None
+        self.is_captured = False
+        self._static_noisy_input = None
+        self._static_timestep = None
+        self._static_cond_concat = None
+        self._static_visual_context = None
+        self._static_mouse_cond = None
+        self._static_keyboard_cond = None
+        self._static_flow_pred = None
+        self._static_aux = None
+        self._captured_current_start = None
+        self._kv_caches = None
+
+
 def check_cuda_graph_compatibility(model: nn.Module) -> List[str]:
     """
     Check if a model is compatible with CUDA Graph capture.
