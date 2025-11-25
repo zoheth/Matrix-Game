@@ -88,16 +88,15 @@ class CacheConfig:
         Returns:
             Action cache size in tokens
         """
-        # PagedCache requires at least 3 pages for effective sliding window eviction
-        # With page_size=16, we need at least 48 tokens (3 pages)
-        # This ensures eviction can work properly without leaving all pages full
+        # ActionCache uses token-level eviction with sliding window
+        # Minimum of 48 tokens provides reasonable context for action conditioning
         MIN_CACHE_SIZE = 48
 
-        # If local_attn_size is -1 (global attention), use default of 48 tokens (3 pages)
+        # If local_attn_size is -1 (global attention), use default of 48 tokens
         if self.local_attn_size == -1:
             return MIN_CACHE_SIZE
 
-        # Ensure cache size is at least 48 for PagedCache to work properly
+        # Ensure cache size is at least 48 for effective sliding window
         return max(MIN_CACHE_SIZE, self.local_attn_size)
 
 

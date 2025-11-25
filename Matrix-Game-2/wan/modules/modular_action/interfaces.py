@@ -9,6 +9,7 @@ from .kernels.kv_cache_kernel import update_kv_cache_optimized
 
 if TYPE_CHECKING:
     import flashinfer
+    from wan.modules.action_cache import ActionCache
 
 try:
     import flashinfer
@@ -41,7 +42,7 @@ class IAttentionInjector(nn.Module, ABC):
         spatial_shape: Tuple[int, int],
         temporal_shape: int,
         is_causal: bool = False,
-        kv_cache=None,  # PagedCache instance or None
+        kv_cache=None,  # ActionCache instance or None
         start_frame: int = 0,
         num_frame_per_block: int = 1,
         block_mask: Optional[torch.Tensor] = None,
