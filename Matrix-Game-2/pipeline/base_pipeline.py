@@ -41,7 +41,6 @@ class BaseCausalInferencePipeline(torch.nn.Module, ABC):
         vae_decoder,
         device: str = "cuda",
         use_cuda_graph: bool = False,
-        use_paged_cache: bool = False,
         page_size: int = 16,
     ):
         """
@@ -53,8 +52,7 @@ class BaseCausalInferencePipeline(torch.nn.Module, ABC):
             vae_decoder: VAE decoder wrapper
             device: Device to run on
             use_cuda_graph: Whether to use CUDA Graph for inference
-            use_paged_cache: Whether to use PagedCache for FlashInfer optimization
-            page_size: Page size for PagedCache (only used if use_paged_cache=True)
+            page_size: Page size for PagedCache
         """
         super().__init__()
 
@@ -63,7 +61,6 @@ class BaseCausalInferencePipeline(torch.nn.Module, ABC):
         self.generator = generator
         self.vae_decoder = vae_decoder
         self.use_cuda_graph = use_cuda_graph
-        self.use_paged_cache = use_paged_cache
         self.page_size = page_size
 
         # CUDA Graph runner (lazy initialization)
@@ -102,7 +99,7 @@ class BaseCausalInferencePipeline(torch.nn.Module, ABC):
 
     def _ensure_cache_initialized(self, batch_size: int, dtype: torch.dtype) -> None:
         """
-        Ensure cache manager is initialized.
+        Ensure cache manager is initialized with PagedCache.
 
         Args:
             batch_size: Batch size for caches
@@ -114,7 +111,6 @@ class BaseCausalInferencePipeline(torch.nn.Module, ABC):
                 cache_config=self.config.cache,
                 device=self.device,
                 dtype=dtype,
-                use_paged_cache=self.use_paged_cache,
                 page_size=self.page_size,
             )
             self.cache_manager.initialize_all_caches(batch_size)

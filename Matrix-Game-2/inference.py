@@ -49,10 +49,8 @@ def parse_args():
                         help="Run a warmup iteration before timing (triggers JIT compilation)")
     parser.add_argument("--use_cuda_graph", action="store_true",
                         help="Use CUDA Graph for inference (captures and replays GPU operations)")
-    parser.add_argument("--use_paged_cache", action="store_true",
-                        help="Use PagedCache for FlashInfer paged attention optimization")
     parser.add_argument("--page_size", type=int, default=16,
-                        help="Page size for PagedCache (default: 16)")
+                        help="Page size for PagedCache (default: 16, always enabled)")
     args = parser.parse_args()
     return args
 
@@ -111,7 +109,6 @@ class InteractiveGameInference:
             vae_decoder=current_vae_decoder,
             device="cuda",
             use_cuda_graph=self.args.use_cuda_graph,
-            use_paged_cache=self.args.use_paged_cache,
             page_size=self.args.page_size,
         ).to(device=self.device, dtype=self.weight_dtype)
 
@@ -297,9 +294,8 @@ def main():
     if available:
         print(f"  FlashInfer Version: {version_info}")
     print(f"  FlashInfer Mode: {args.flashinfer_mode.upper()}")
-    print(f"  Paged Cache: {'ENABLED' if args.use_paged_cache else 'DISABLED'}")
-    if args.use_paged_cache:
-        print(f"  Page Size: {args.page_size}")
+    print(f"  Paged Cache: ENABLED (always)")
+    print(f"  Page Size: {args.page_size}")
     print(f"  CUDA Graph: {'ENABLED' if args.use_cuda_graph else 'DISABLED'}")
     print(f"{'='*60}\n")
 

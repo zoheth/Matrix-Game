@@ -14,7 +14,7 @@ from wan.modules.modular_action.interfaces import (
 from wan.modules.modular_action.action_config import ActionConfig
 
 from .kernels.preprocessor_kernel import mouse_preprocessor_triton
-from .kernels.before_attn_kernel import update_kv_cache_triton
+# Note: Triton KV cache kernel disabled - PagedCache uses standard path
 
 class MousePreprocessor(IActionPreprocessor):
     """
@@ -447,26 +447,32 @@ class KeyboardInjector(IAttentionInjector):
         # Apply RoPE to K: [B, T_k, H, D] -> [B, T_k, H, D]
         k_rope = self.attn_core._apply_rope_single(k, start_frame)
 
-        if is_causal and kv_cache is not None:
-            # For Triton kernel, we need K, V in shape [S, num_new_tokens, num_heads, head_dim]
-            # Current: k_rope is [B, T_k, H, D], v is [B, T_k, H, D]
-            # We need to expand to spatial dimension and transpose to get the right shape
+        # Extract dimensions for cache operations
+        T_k = k_rope.shape[1]  # Temporal dimension of keyboard condition
+        num_heads = self.action_config.heads_num
+        head_dim = self.action_config.keyboard_head_dim
 
+        if is_causal and kv_cache is not None:
+            # Use standard PagedCache path (Triton kernel can be re-implemented later)
+            # Need to mean-pool spatially before caching: [B, T_k, H, D] -> [B, 1, H, D] for mouse
+            # But for now, we cache per-spatial-location
+
+            # For mouse cache, we cache [B*S, T_k, H, D] format
             # Expand to spatial dimension: [B, T_k, H, D] -> [B, S, T_k, H, D]
             k_rope_expanded = k_rope.unsqueeze(1).expand(-1, S, -1, -1, -1)
             v_expanded = v.unsqueeze(1).expand(-1, S, -1, -1, -1)
 
-            # Transpose to [S, T_k, H, D] format for Triton kernel (take first batch)
-            k_rope_for_cache = k_rope_expanded[0]  # [S, T_k, H, D]
-            v_for_cache = v_expanded[0]  # [S, T_k, H, D]
+            # Reshape to [B*S, T_k, H, D] for cache update
+            k_rope_for_cache = k_rope_expanded.reshape(B * S, T_k, num_heads, head_dim)
+            v_for_cache = v_expanded.reshape(B * S, T_k, num_heads, head_dim)
 
-            # Use Triton fused kernel for KV cache update with mean operation
-            k_window, v_window, _, _ = update_kv_cache_triton(
+            # Use standard KV cache update (supports PagedCache)
+            # Note: Currently assumes B*S = 1, so we take [0] slice
+            k_window, v_window, _, _ = self.kv_cache_manager.update_cache(
                 kv_cache,
-                k_rope_for_cache,  # [S, T_k, H, D]
-                v_for_cache,       # [S, T_k, H, D]
-                max_attention_size=self.kv_cache_manager.max_attention_size,
-                sink_tokens=self.kv_cache_manager.sink_tokens,
+                k_rope_for_cache[0:1],  # [1, T_k, H, D]
+                v_for_cache[0:1],       # [1, T_k, H, D]
+                num_new_tokens=T_k,
             )
 
             # Expand window to all spatial locations: [1, window_len, H, D] -> [B*S, window_len, H, D]

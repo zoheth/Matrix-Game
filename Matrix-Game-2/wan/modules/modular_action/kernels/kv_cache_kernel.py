@@ -1,18 +1,18 @@
 """
-Optimized KV cache management that minimizes D2H transfers.
+Optimized KV cache management for PagedCache.
 
-Key optimizations:
-1. Batch index reads to reduce D2H transfers from 8 to 2
-2. Use torch.roll() instead of manual slicing + clone()
-3. Leverage PyTorch's optimized memory operations
+Now uses PagedCache for efficient memory management with FlashInfer integration.
 """
 
 import torch
-from typing import Dict, Tuple
+from typing import Tuple, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from wan.modules.paged_cache import PagedCache
 
 
 def update_kv_cache_optimized(
-    kv_cache: Dict[str, torch.Tensor],
+    kv_cache: "PagedCache",
     k: torch.Tensor,
     v: torch.Tensor,
     num_new_tokens: int,
@@ -20,20 +20,15 @@ def update_kv_cache_optimized(
     sink_tokens: int = 0,
 ) -> Tuple[torch.Tensor, torch.Tensor, int, int]:
     """
-    Optimized KV cache update with minimal D2H transfers.
-
-    Improvements over original:
-    - Reduces .item() calls from 8 to 2 (75% reduction in D2H transfers)
-    - Replaces .clone() with torch.roll() for better performance
-    - Uses in-place operations where possible
+    Update PagedCache with new KV pairs and return attention window.
 
     Args:
-        kv_cache: Dictionary containing 'k', 'v', 'global_end_index', 'local_end_index'
+        kv_cache: PagedCache instance
         k: New keys [BS, num_new_tokens, num_heads, head_dim]
         v: New values [BS, num_new_tokens, num_heads, head_dim]
         num_new_tokens: Number of new tokens to add
         max_attention_size: Maximum attention window size
-        sink_tokens: Number of sink tokens to preserve (usually 0)
+        sink_tokens: Number of sink tokens to preserve (unused with PagedCache)
 
     Returns:
         k_window: Keys in attention window [BS, window_len, num_heads, head_dim]
@@ -41,92 +36,68 @@ def update_kv_cache_optimized(
         local_start_index: Start index in cache (Python int)
         local_end_index: End index in cache (Python int)
     """
-    # Cache size from tensor shape (no D2H - shape is cached on CPU)
-    cache_size = kv_cache["k"].size(1)
+    batch_size = k.size(0)
 
-    # KEY OPTIMIZATION: Batch index reads - only 2 .item() calls instead of 8
-    # Read both indices in one go to minimize sync overhead
-    global_end_idx = kv_cache["global_end_index"].item()  # D2H #1
-    local_end_idx = kv_cache["local_end_index"].item()    # D2H #2
-
-    # All subsequent computations are pure Python arithmetic (no D2H)
-    current_end = global_end_idx + num_new_tokens
-
-    # Check if eviction is needed
-    needs_eviction = (num_new_tokens + local_end_idx) > cache_size
-
-    if needs_eviction:
-        # Calculate eviction parameters
-        num_evicted_tokens = num_new_tokens + local_end_idx - cache_size
-        num_rolled_tokens = local_end_idx - num_evicted_tokens - sink_tokens
-
-        if num_rolled_tokens > 0:
-            # KEY OPTIMIZATION: Use torch.roll() instead of slice + clone()
-            # torch.roll() is:
-            # 1. Implemented as a single optimized CUDA kernel
-            # 2. Avoids intermediate .clone() allocation
-            # 3. Faster than manual slicing operations
-
-            # However, torch.roll() rolls the entire tensor, we need selective rolling
-            # So we use a more efficient slicing approach without .clone()
-
-            src_start = sink_tokens + num_evicted_tokens
-            src_end = src_start + num_rolled_tokens
-            dst_start = sink_tokens
-            dst_end = dst_start + num_rolled_tokens
-
-            # In-place copy (no .clone() needed - PyTorch handles overlapping correctly)
-            # Use .contiguous() to ensure efficient memory layout
-            kv_cache["k"][:, dst_start:dst_end] = kv_cache["k"][:, src_start:src_end].contiguous()
-            kv_cache["v"][:, dst_start:dst_end] = kv_cache["v"][:, src_start:src_end].contiguous()
-
-        local_end_index = local_end_idx + num_new_tokens - num_evicted_tokens
+    # PagedCache only supports batch_size=1, so we take the first batch
+    # For keyboard/mouse with spatial batching, we assume all spatial locations share the same cache
+    if batch_size > 1:
+        # Take first batch for caching (mean pooling would be better but more complex)
+        k_for_cache = k[0:1]  # [1, num_new_tokens, num_heads, head_dim]
+        v_for_cache = v[0:1]
     else:
-        # No eviction needed
-        local_end_index = local_end_idx + num_new_tokens
+        k_for_cache = k
+        v_for_cache = v
 
-    local_start_index = local_end_index - num_new_tokens
+    k_squeezed = k_for_cache.squeeze(0)  # [num_new_tokens, num_heads, head_dim]
+    v_squeezed = v_for_cache.squeeze(0)  # [num_new_tokens, num_heads, head_dim]
 
-    # Insert new keys/values (in-place, no copy)
-    kv_cache["k"][:, local_start_index:local_end_index] = k
-    kv_cache["v"][:, local_start_index:local_end_index] = v
+    # Calculate current position
+    current_start = kv_cache.global_end_index
+    current_end = current_start + num_new_tokens
 
-    # Update global indices (in-place, no D2H)
-    kv_cache["global_end_index"].fill_(current_end)
-    kv_cache["local_end_index"].fill_(local_end_index)
+    # Evict old tokens BEFORE appending to make room (sliding window)
+    # We need to respect both max_attention_size and cache capacity
+    cache_capacity = kv_cache.max_pages * kv_cache.page_size
+    page_size = kv_cache.page_size
 
-    # Extract attention window (view, not copy)
-    window_start = max(0, local_end_index - max_attention_size)
-    k_window = kv_cache["k"][:, window_start:local_end_index]
-    v_window = kv_cache["v"][:, window_start:local_end_index]
+    # If max_attention_size is -1 (global attention), use cache_capacity as limit
+    if max_attention_size == -1:
+        effective_max_size = cache_capacity
+    else:
+        effective_max_size = min(max_attention_size, cache_capacity)
+
+    # Evict to make room for new tokens
+    # PagedCache evicts at page granularity, so we need to ensure we evict enough pages
+    current_seq_len = kv_cache.seq_len
+    tokens_after_append = current_seq_len + num_new_tokens
+
+    if tokens_after_append > effective_max_size:
+        # Calculate how many tokens need to be removed
+        tokens_to_remove = tokens_after_append - effective_max_size
+
+        # Round up to full pages to ensure we remove enough
+        # Use ceiling division: (tokens_to_remove + page_size - 1) // page_size
+        pages_to_remove = (tokens_to_remove + page_size - 1) // page_size
+
+        # Calculate target size after removing pages
+        target_size = max(0, current_seq_len - pages_to_remove * page_size)
+        kv_cache.evict(target_size)
+    # else: no eviction needed, we're within limits
+
+    # Update cache using PagedCache's update_or_append method
+    kv_cache.update_or_append(k_squeezed, v_squeezed, current_start, current_end)
+
+    # Get contiguous KV for attention
+    k_contiguous, v_contiguous = kv_cache.get_kv_for_attention()
+
+    # Expand to match original batch size
+    k_window = k_contiguous.unsqueeze(0).expand(batch_size, -1, -1, -1)  # [BS, seq_len, num_heads, head_dim]
+    v_window = v_contiguous.unsqueeze(0).expand(batch_size, -1, -1, -1)
+
+    # Return indices for compatibility
+    local_end_index = kv_cache.seq_len
+    local_start_index = max(0, local_end_index - num_new_tokens)
 
     return k_window, v_window, local_start_index, local_end_index
 
 
-def update_kv_cache_triton(
-    kv_cache: Dict[str, torch.Tensor],
-    k: torch.Tensor,
-    v: torch.Tensor,
-    num_new_tokens: int,
-    max_attention_size: int,
-    sink_tokens: int = 0,
-) -> Tuple[torch.Tensor, torch.Tensor, int, int]:
-    """
-    Triton-based KV cache update (FUTURE WORK - for extreme optimization).
-
-    This would provide:
-    - Zero D2H transfers (all index computation on GPU)
-    - Fused operations (eviction + insertion in one kernel)
-    - Best possible performance
-
-    However, the complexity/benefit tradeoff may not be worth it unless:
-    1. KV cache updates are a proven bottleneck (>10% of total time)
-    2. Cache size is very large (>10000 tokens)
-    3. Frequent evictions occur
-
-    For now, use update_kv_cache_optimized() which provides 75% of the benefit
-    with 10% of the implementation complexity.
-    """
-    raise NotImplementedError(
-        "Triton implementation deferred. Use update_kv_cache_optimized() instead."
-    )

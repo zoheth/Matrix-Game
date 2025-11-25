@@ -4,24 +4,14 @@ KV Cache management for the causal inference pipeline.
 This module encapsulates all logic related to creating, initializing,
 and resetting KV caches and cross-attention caches.
 
-Supports two cache modes:
-1. Dict-based cache (legacy): Uses torch tensors with rolling buffer eviction
-2. PagedCache (FlashInfer): Uses paged memory management for efficient FlashInfer integration
+All caches now use PagedCache for efficient FlashInfer integration.
 """
 
-from typing import List, Dict, Optional, Union
+from typing import List, Dict, Optional
 import torch
 
 from pipeline.config import ModelConfig, CacheConfig
-
-# Try to import PagedCache for FlashInfer support
-try:
-    from wan.modules.paged_cache import PagedCache, PagedCacheManager
-    PAGED_CACHE_AVAILABLE = True
-except ImportError:
-    PAGED_CACHE_AVAILABLE = False
-    PagedCache = None
-    PagedCacheManager = None
+from wan.modules.paged_cache import PagedCache, PagedCacheManager
 
 
 class CacheManager:
@@ -29,16 +19,12 @@ class CacheManager:
     Manages KV caches for the transformer model.
 
     This class handles:
-    - Visual self-attention cache
-    - Mouse action conditioning cache
-    - Keyboard action conditioning cache
-    - Cross-attention cache
+    - Visual self-attention cache (PagedCache for FlashInfer)
+    - Mouse action conditioning cache (PagedCache)
+    - Keyboard action conditioning cache (PagedCache)
+    - Cross-attention cache (simple tensor storage)
 
-    Supports two modes:
-    - Dict-based cache (legacy): Standard torch tensor caches
-    - PagedCache (FlashInfer): Paged memory management for FlashInfer
-
-    The caches are structured as lists of dictionaries/PagedCache, one per transformer block.
+    All visual and action caches use PagedCache for efficient FlashInfer integration.
     """
 
     def __init__(
@@ -47,7 +33,6 @@ class CacheManager:
         cache_config: CacheConfig,
         device: torch.device,
         dtype: torch.dtype,
-        use_paged_cache: bool = False,
         page_size: int = 16,
     ):
         """
@@ -58,43 +43,33 @@ class CacheManager:
             cache_config: Cache configuration
             device: Device to place caches on
             dtype: Data type for cache tensors
-            use_paged_cache: Whether to use PagedCache for FlashInfer
-            page_size: Page size for PagedCache (only used if use_paged_cache=True)
+            page_size: Page size for PagedCache
         """
         self.model_config = model_config
         self.cache_config = cache_config
         self.device = device
         self.dtype = dtype
-        self.use_paged_cache = use_paged_cache and PAGED_CACHE_AVAILABLE
         self.page_size = page_size
 
-        if use_paged_cache and not PAGED_CACHE_AVAILABLE:
-            print("[WARNING] PagedCache requested but not available, falling back to dict-based cache")
-
-        # Cache storage (type depends on use_paged_cache)
-        self.visual_cache: Optional[Union[List[Dict[str, torch.Tensor]], List[PagedCache]]] = None
-        self.mouse_cache: Optional[List[Dict[str, torch.Tensor]]] = None
-        self.keyboard_cache: Optional[List[Dict[str, torch.Tensor]]] = None
+        # Cache storage - all use PagedCache except cross-attention
+        self.visual_cache: Optional[List[PagedCache]] = None
+        self.mouse_cache: Optional[List[PagedCache]] = None
+        self.keyboard_cache: Optional[List[PagedCache]] = None
         self.crossattn_cache: Optional[List[Dict[str, torch.Tensor]]] = None
-
-        # PagedCacheManager for FlashInfer (if enabled)
-        self._paged_cache_manager: Optional[PagedCacheManager] = None
 
     def initialize_all_caches(self, batch_size: int = 1) -> None:
         """
-        Initialize all caches with zeros.
+        Initialize all caches with PagedCache.
 
         Args:
-            batch_size: Batch size for cache tensors
+            batch_size: Batch size for cache tensors (currently only 1 is supported)
         """
-        if self.use_paged_cache:
-            self.visual_cache = self._create_paged_visual_cache(batch_size)
-        else:
-            self.visual_cache = self._create_visual_cache(batch_size)
+        assert batch_size == 1, "PagedCache currently only supports batch_size=1"
 
-        # Action and cross-attention caches always use dict-based approach
-        self.mouse_cache = self._create_mouse_cache(batch_size)
-        self.keyboard_cache = self._create_keyboard_cache(batch_size)
+        # Initialize all caches with PagedCache
+        self.visual_cache = self._create_paged_visual_cache(batch_size)
+        self.mouse_cache = self._create_paged_mouse_cache(batch_size)
+        self.keyboard_cache = self._create_paged_keyboard_cache(batch_size)
         self.crossattn_cache = self._create_crossattn_cache(batch_size)
 
     def _create_paged_visual_cache(self, batch_size: int) -> List[PagedCache]:
@@ -127,107 +102,66 @@ class CacheManager:
 
         return cache
 
-    def _create_visual_cache(self, batch_size: int) -> List[Dict[str, torch.Tensor]]:
+
+    def _create_paged_mouse_cache(self, batch_size: int) -> List[PagedCache]:
         """
-        Create the visual self-attention KV cache.
+        Create paged mouse action conditioning cache.
 
         Args:
-            batch_size: Batch size
+            batch_size: Batch size (currently only 1 is supported)
 
         Returns:
-            List of cache dictionaries, one per transformer block
+            List of PagedCache instances, one per transformer block
         """
-        cache_size = self.cache_config.get_visual_cache_size(self.model_config.frame_seq_length)
-        num_heads = self.model_config.num_attention_heads
-        head_dim = self.model_config.head_dim
+        assert batch_size == 1, "PagedCache currently only supports batch_size=1"
 
-        cache = []
-        for _ in range(self.model_config.num_transformer_blocks):
-            cache.append({
-                "k": torch.zeros(
-                    [batch_size, cache_size, num_heads, head_dim],
-                    dtype=self.dtype,
-                    device=self.device
-                ),
-                "v": torch.zeros(
-                    [batch_size, cache_size, num_heads, head_dim],
-                    dtype=self.dtype,
-                    device=self.device
-                ),
-                "global_end_index": torch.tensor([0], dtype=torch.long, device=self.device),
-                "local_end_index": torch.tensor([0], dtype=torch.long, device=self.device)
-            })
-
-        return cache
-
-    def _create_action_cache_base(
-        self,
-        batch_size: int,
-        batch_multiplier: int = 1
-    ) -> List[Dict[str, torch.Tensor]]:
-        """
-        Create a base action conditioning cache (shared logic for mouse/keyboard).
-
-        Args:
-            batch_size: Base batch size
-            batch_multiplier: Multiplier for batch dimension (1 for keyboard, frame_seq_length for mouse)
-
-        Returns:
-            List of cache dictionaries
-        """
         cache_size = self.cache_config.get_action_cache_size()
         num_heads = self.model_config.num_action_attention_heads
         head_dim = self.model_config.action_head_dim
-        effective_batch = batch_size * batch_multiplier
 
         cache = []
         for _ in range(self.model_config.num_transformer_blocks):
-            cache.append({
-                "k": torch.zeros(
-                    [effective_batch, cache_size, num_heads, head_dim],
-                    dtype=self.dtype,
-                    device=self.device
-                ),
-                "v": torch.zeros(
-                    [effective_batch, cache_size, num_heads, head_dim],
-                    dtype=self.dtype,
-                    device=self.device
-                ),
-                "global_end_index": torch.tensor([0], dtype=torch.long, device=self.device),
-                "local_end_index": torch.tensor([0], dtype=torch.long, device=self.device)
-            })
+            cache.append(PagedCache(
+                max_total_tokens=cache_size,
+                page_size=self.page_size,
+                num_heads=num_heads,
+                head_dim=head_dim,
+                sink_size=0,
+                dtype=self.dtype,
+                device=self.device,
+            ))
 
         return cache
 
-    def _create_mouse_cache(self, batch_size: int) -> List[Dict[str, torch.Tensor]]:
+    def _create_paged_keyboard_cache(self, batch_size: int) -> List[PagedCache]:
         """
-        Create the mouse action conditioning cache.
-
-        The mouse cache has a special structure where the batch dimension
-        is multiplied by frame_seq_length.
+        Create paged keyboard action conditioning cache.
 
         Args:
-            batch_size: Batch size
+            batch_size: Batch size (currently only 1 is supported)
 
         Returns:
-            List of cache dictionaries
+            List of PagedCache instances, one per transformer block
         """
-        return self._create_action_cache_base(
-            batch_size,
-            batch_multiplier=self.model_config.frame_seq_length
-        )
+        assert batch_size == 1, "PagedCache currently only supports batch_size=1"
 
-    def _create_keyboard_cache(self, batch_size: int) -> List[Dict[str, torch.Tensor]]:
-        """
-        Create the keyboard action conditioning cache.
+        cache_size = self.cache_config.get_action_cache_size()
+        num_heads = self.model_config.num_action_attention_heads
+        head_dim = self.model_config.action_head_dim
 
-        Args:
-            batch_size: Batch size
+        cache = []
+        for _ in range(self.model_config.num_transformer_blocks):
+            cache.append(PagedCache(
+                max_total_tokens=cache_size,
+                page_size=self.page_size,
+                num_heads=num_heads,
+                head_dim=head_dim,
+                sink_size=0,
+                dtype=self.dtype,
+                device=self.device,
+            ))
 
-        Returns:
-            List of cache dictionaries
-        """
-        return self._create_action_cache_base(batch_size, batch_multiplier=1)
+        return cache
 
     def _create_crossattn_cache(self, batch_size: int) -> List[Dict[str, torch.Tensor]]:
         """
@@ -275,31 +209,20 @@ class CacheManager:
         for block_cache in self.crossattn_cache:
             block_cache["is_init"] = False
 
-        # Reset visual self-attention cache
-        if self.use_paged_cache:
-            # PagedCache has its own reset method
-            for block_cache in self.visual_cache:
-                block_cache.reset()
-        else:
-            # Dict-based cache
-            for block_cache in self.visual_cache:
-                block_cache["global_end_index"] = torch.tensor([0], dtype=torch.long, device=self.device)
-                block_cache["local_end_index"] = torch.tensor([0], dtype=torch.long, device=self.device)
+        # Reset all PagedCache instances
+        for block_cache in self.visual_cache:
+            block_cache.reset()
 
-        # Reset mouse cache (always dict-based)
         for block_cache in self.mouse_cache:
-            block_cache["global_end_index"] = torch.tensor([0], dtype=torch.long, device=self.device)
-            block_cache["local_end_index"] = torch.tensor([0], dtype=torch.long, device=self.device)
+            block_cache.reset()
 
-        # Reset keyboard cache (always dict-based)
         for block_cache in self.keyboard_cache:
-            block_cache["global_end_index"] = torch.tensor([0], dtype=torch.long, device=self.device)
-            block_cache["local_end_index"] = torch.tensor([0], dtype=torch.long, device=self.device)
+            block_cache.reset()
 
     def get_caches(self) -> tuple[
-        Union[List[Dict[str, torch.Tensor]], List[PagedCache]],
-        List[Dict[str, torch.Tensor]],
-        List[Dict[str, torch.Tensor]],
+        List[PagedCache],
+        List[PagedCache],
+        List[PagedCache],
         List[Dict[str, torch.Tensor]]
     ]:
         """
@@ -307,7 +230,7 @@ class CacheManager:
 
         Returns:
             Tuple of (visual_cache, mouse_cache, keyboard_cache, crossattn_cache)
-            visual_cache can be either List[Dict] or List[PagedCache] depending on use_paged_cache
+            All caches except cross-attention use PagedCache.
         """
         if self.visual_cache is None:
             raise RuntimeError("Caches must be initialized before access")

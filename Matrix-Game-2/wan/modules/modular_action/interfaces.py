@@ -1,5 +1,5 @@
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
 from torch import nn
@@ -41,7 +41,7 @@ class IAttentionInjector(nn.Module, ABC):
         spatial_shape: Tuple[int, int],
         temporal_shape: int,
         is_causal: bool = False,
-        kv_cache: Optional[Dict[str, torch.Tensor]] = None,
+        kv_cache=None,  # PagedCache instance or None
         start_frame: int = 0,
         num_frame_per_block: int = 1,
         block_mask: Optional[torch.Tensor] = None,
@@ -49,7 +49,7 @@ class IAttentionInjector(nn.Module, ABC):
         pass
     
 class KVCacheManager(nn.Module):
-    """Manages KV cache with sliding window and optional sink tokens"""
+    """Manages KV cache with sliding window using PagedCache"""
     def __init__(self, local_attn_size: int, sink_size: int = 0):
         super().__init__()
         self.max_attention_size = local_attn_size
@@ -57,18 +57,16 @@ class KVCacheManager(nn.Module):
 
     def update_cache(
         self,
-        kv_cache: Dict[str, torch.Tensor],
+        kv_cache,  # PagedCache instance
         k: torch.Tensor,
         v: torch.Tensor,
         num_new_tokens: int
     ) -> Tuple[torch.Tensor, torch.Tensor, int, int]:
         """
-        Update KV cache with new key-value pairs using sliding window strategy.
-
-        OPTIMIZED: Uses update_kv_cache_optimized() to minimize D2H transfers.
+        Update PagedCache with new key-value pairs using sliding window strategy.
 
         Args:
-            kv_cache: Dictionary containing 'k', 'v', 'global_end_index', 'local_end_index'
+            kv_cache: PagedCache instance
             k: New keys [BS, num_new_tokens, num_heads, head_dim]
             v: New values [BS, num_new_tokens, num_heads, head_dim]
             num_new_tokens: Number of new tokens to add

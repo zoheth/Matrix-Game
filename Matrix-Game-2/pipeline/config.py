@@ -76,6 +76,9 @@ class CacheConfig:
         Returns:
             Total cache size in tokens
         """
+        # If local_attn_size is -1 (global attention), use default of 15 frames
+        if self.local_attn_size == -1:
+            return 15 * frame_seq_length
         return self.local_attn_size * frame_seq_length
 
     def get_action_cache_size(self) -> int:
@@ -85,7 +88,17 @@ class CacheConfig:
         Returns:
             Action cache size in tokens
         """
-        return self.local_attn_size
+        # PagedCache requires at least 3 pages for effective sliding window eviction
+        # With page_size=16, we need at least 48 tokens (3 pages)
+        # This ensures eviction can work properly without leaving all pages full
+        MIN_CACHE_SIZE = 48
+
+        # If local_attn_size is -1 (global attention), use default of 48 tokens (3 pages)
+        if self.local_attn_size == -1:
+            return MIN_CACHE_SIZE
+
+        # Ensure cache size is at least 48 for PagedCache to work properly
+        return max(MIN_CACHE_SIZE, self.local_attn_size)
 
 
 @dataclass
