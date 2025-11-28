@@ -17,14 +17,6 @@ from utils.conditions import *
 from utils.wan_wrapper import WanDiffusionWrapper
 from safetensors.torch import load_file
 
-# FlashInfer integration
-from wan.modules.flashinfer_integration import (
-    maybe_use_flashinfer_attention,
-    get_flashinfer_mode,
-    check_flashinfer_available,
-    print_validation_summary,
-    FlashInferMode,
-)
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -41,16 +33,12 @@ def parse_args():
                         help="VAE decoder compile mode: auto (use cache if available), force (recompile), none (no compile)")
     parser.add_argument("--use_new_vae", action="store_true",
                         help="Use new VaeDecoder3d implementation instead of old VAEDecoder3d")
-    # FlashInfer options
-    parser.add_argument("--flashinfer_mode", type=str, default="disabled",
-                        choices=["disabled", "validate", "enabled"],
-                        help="FlashInfer mode: disabled (original), validate (compare both), enabled (use FlashInfer)")
     parser.add_argument("--warmup", action="store_true",
                         help="Run a warmup iteration before timing (triggers JIT compilation)")
     parser.add_argument("--use_cuda_graph", action="store_true",
                         help="Use CUDA Graph for inference (captures and replays GPU operations)")
     parser.add_argument("--page_size", type=int, default=16,
-                        help="Page size for PagedCache (default: 16, always enabled)")
+                        help="Page size for PagedCache (default: 16)")
     args = parser.parse_args()
     return args
 
@@ -60,11 +48,6 @@ class InteractiveGameInference:
         self.enable_profile = args.enable_profile
         self.device = torch.device("cuda")
         self.weight_dtype = torch.bfloat16
-
-        # Set FlashInfer mode from args (can also be set via env var)
-        if args.flashinfer_mode != "disabled":
-            os.environ["FLASHINFER_MODE"] = args.flashinfer_mode.upper()
-        self.flashinfer_mode = get_flashinfer_mode()
 
         self._init_config()
         self._init_models()
@@ -79,7 +62,7 @@ class InteractiveGameInference:
         self.config = OmegaConf.load(self.args.config_path)
 
     def _init_models(self):
-        # Initialize diffusion model
+        # Initialize diffusion model with FlashInfer attention (default)
         generator = WanDiffusionWrapper(
             **getattr(self.config, "model_kwargs", {}), is_causal=True)
 
@@ -88,10 +71,6 @@ class InteractiveGameInference:
             print("Loading Pretrained Model...")
             state_dict = load_file(self.args.checkpoint_path)
             generator.load_state_dict(state_dict)
-
-        # Apply FlashInfer optimization if enabled
-        # This must be done BEFORE moving to device for proper weight copying
-        generator = maybe_use_flashinfer_attention(generator)
 
         # Load and optionally compile VAE decoder
         current_vae_decoder = self._load_vae_decoder()
@@ -273,10 +252,6 @@ class InteractiveGameInference:
             process_video(video.astype(np.uint8), self.args.output_folder+f'/demo.mp4', config, mouse_icon, mouse_scale=0.1, process_icon=False, mode=mode)
             process_video(video.astype(np.uint8), self.args.output_folder+f'/demo_icon.mp4', config, mouse_icon, mouse_scale=0.1, process_icon=True, mode=mode)
 
-        # Print validation summary if in VALIDATE mode
-        if self.flashinfer_mode == FlashInferMode.VALIDATE:
-            print_validation_summary(self.pipeline.generator.model)
-
         print("Done")
 
 def main():
@@ -285,16 +260,12 @@ def main():
     set_seed(args.seed)
     os.makedirs(args.output_folder, exist_ok=True)
 
-    # Print optimization status
-    available, version_info = check_flashinfer_available()
+    # Print configuration
     print(f"\n{'='*60}")
-    print(f"Optimization Status")
+    print(f"Generation Configuration")
     print(f"{'='*60}")
-    print(f"  FlashInfer Available: {available}")
-    if available:
-        print(f"  FlashInfer Version: {version_info}")
-    print(f"  FlashInfer Mode: {args.flashinfer_mode.upper()}")
-    print(f"  Paged Cache: ENABLED (always)")
+    print(f"  Attention: FlashInfer (default)")
+    print(f"  Paged Cache: ENABLED")
     print(f"  Page Size: {args.page_size}")
     print(f"  CUDA Graph: {'ENABLED' if args.use_cuda_graph else 'DISABLED'}")
     print(f"{'='*60}\n")

@@ -313,39 +313,5 @@ class TestCUDAGraphInfrastructure:
         assert config.warmup_iterations == 3
 
 
-class TestIntegration:
-    """Integration tests for the full pipeline."""
-
-    @pytest.mark.slow
-    def test_replace_attention_with_flashinfer(self):
-        """Test that attention replacement works correctly."""
-        from wan.modules.flashinfer_attention import replace_attention_with_flashinfer
-        from wan.modules.causal_model import CausalWanSelfAttention
-
-        # Create a simple model with CausalWanSelfAttention
-        class SimpleModel(torch.nn.Module):
-            def __init__(self):
-                super().__init__()
-                self.attn = CausalWanSelfAttention(
-                    dim=1536,
-                    num_heads=12,
-                    local_attn_size=5,
-                )
-
-        model = SimpleModel()
-
-        # Check original type
-        assert isinstance(model.attn, CausalWanSelfAttention)
-
-        # Replace with FlashInfer
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        model = model.to(device)
-        model = replace_attention_with_flashinfer(model)
-
-        # Check new type
-        from wan.modules.flashinfer_attention import FlashInferCausalSelfAttention
-        assert isinstance(model.attn, FlashInferCausalSelfAttention)
-
-
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

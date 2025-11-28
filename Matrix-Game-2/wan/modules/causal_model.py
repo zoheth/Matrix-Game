@@ -9,6 +9,7 @@ from wan.modules.model import (
     sinusoidal_embedding_1d
 )
 from wan.modules.action_context import ActionContext, BlockMaskFactory
+from wan.modules.flashinfer_attention import FlashInferCausalSelfAttention, FlashInferPlanner
 from diffusers.loaders import FromOriginalModelMixin, PeftAdapterMixin
 from torch.nn.attention.flex_attention import create_block_mask, flex_attention
 from diffusers.configuration_utils import ConfigMixin, register_to_config
@@ -19,10 +20,7 @@ import torch
 import math
 import os
 import torch.distributed as dist
-from typing import Optional, List, Dict, TYPE_CHECKING
-
-if TYPE_CHECKING:
-    from .flashinfer_attention import FlashInferPlanner
+from typing import Optional, List, Dict
 
 # 允许通过环境变量选择使用模块化版本
 USE_MODULAR_ACTION = os.environ.get("USE_MODULAR_ACTION", "1") == "1"
@@ -77,185 +75,6 @@ def causal_rope_apply(x, grid_sizes, freqs, start_frame=0):
     return torch.stack(output).type_as(x)
 
 
-class CausalWanSelfAttention(nn.Module):
-
-    def __init__(self,
-                 dim,
-                 num_heads,
-                 local_attn_size=-1,
-                 sink_size=0,
-                 qk_norm=True,
-                 eps=1e-6):
-        assert dim % num_heads == 0
-        super().__init__()
-        self.dim = dim
-        self.num_heads = num_heads
-        self.head_dim = dim // num_heads
-        self.local_attn_size = local_attn_size
-        self.sink_size = sink_size
-        self.qk_norm = qk_norm
-        self.eps = eps
-        self.max_attention_size = 15 * 1 * 880 if local_attn_size == -1 else local_attn_size * 880
-        # layers
-        self.q = nn.Linear(dim, dim)
-        self.k = nn.Linear(dim, dim)
-        self.v = nn.Linear(dim, dim)
-        self.o = nn.Linear(dim, dim)
-    
-        self.norm_q = nn.RMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
-        self.norm_k = nn.RMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
-    def forward(
-        self,
-        x,
-        seq_lens,
-        grid_sizes,
-        freqs,
-        block_mask,
-        kv_cache=None,
-        current_start=0,
-        cache_start=None,
-        planner=None,  # Unused, for API compatibility with FlashInferCausalSelfAttention
-    ):
-        r"""
-        Args:
-            x(Tensor): Shape [B, L, C] # num_heads, C / num_heads]
-            seq_lens(Tensor): Shape [B]
-            grid_sizes(Tensor): Shape [B, 3], the second dimension contains (F, H, W)
-            freqs(Tensor): Rope freqs, shape [1024, C / num_heads / 2]
-            block_mask (BlockMask)
-            planner: Unused, for API compatibility with FlashInferCausalSelfAttention
-        """
-        del planner  # Unused
-        b, s, n, d = *x.shape[:2], self.num_heads, self.head_dim
-        if cache_start is None:
-            cache_start = current_start
-
-        # query, key, value function
-        def qkv_fn(x):
-            q = self.norm_q(self.q(x)).view(b, s, n, d)
-            k = self.norm_k(self.k(x)).view(b, s, n, d)
-            v = self.v(x).view(b, s, n, d)
-            return q, k, v
-
-        q, k, v = qkv_fn(x) # B, F, HW, C
-
-        if kv_cache is None:
-            roped_query = rope_apply(q, grid_sizes, freqs).type_as(v)
-            roped_key = rope_apply(k, grid_sizes, freqs).type_as(v)
-
-            padded_length = math.ceil(q.shape[1] / 128) * 128 - q.shape[1]
-            padded_roped_query = torch.cat(
-                [roped_query,
-                    torch.zeros([q.shape[0], padded_length, q.shape[2], q.shape[3]],
-                                device=q.device, dtype=v.dtype)],
-                dim=1
-            )
-
-            padded_roped_key = torch.cat(
-                [roped_key, torch.zeros([k.shape[0], padded_length, k.shape[2], k.shape[3]],
-                                        device=k.device, dtype=v.dtype)],
-                dim=1
-            )
-
-            padded_v = torch.cat(
-                [v, torch.zeros([v.shape[0], padded_length, v.shape[2], v.shape[3]],
-                                device=v.device, dtype=v.dtype)],
-                dim=1
-            )
-
-            x = flex_attention(
-                query=padded_roped_query.transpose(2, 1), # after: B, HW, F, C
-                key=padded_roped_key.transpose(2, 1),
-                value=padded_v.transpose(2, 1),
-                block_mask=block_mask
-            )[:, :, :-padded_length].transpose(2, 1)
-        else:
-            # Check if this is a PagedCache (new implementation)
-            from wan.modules.paged_cache import PagedCache
-            if isinstance(kv_cache, PagedCache):
-                # PagedCache path
-                assert grid_sizes.ndim == 1
-                assert b == 1, "PagedCache currently only supports batch size 1"
-
-                frame_seqlen = math.prod(grid_sizes[1:]).item()
-                current_start_frame = current_start // frame_seqlen
-                roped_query = causal_rope_apply(
-                    q, grid_sizes, freqs, start_frame=current_start_frame).type_as(v)
-                roped_key = causal_rope_apply(
-                    k, grid_sizes, freqs, start_frame=current_start_frame).type_as(v)
-
-                # Squeeze batch dimension for PagedCache (expects [seq_len, num_heads, head_dim])
-                roped_key_squeezed = roped_key.squeeze(0)
-                v_squeezed = v.squeeze(0)
-
-                # Calculate current_end
-                current_end = current_start + roped_key_squeezed.shape[0]
-
-                # Update cache: handles both denoising (overwrite) and new frames (append)
-                kv_cache.update_or_append(roped_key_squeezed, v_squeezed, current_start, current_end)
-
-                # Evict old pages if needed (sliding window)
-                kv_cache.evict(self.max_attention_size)
-
-                # Get K/V for attention (fallback to contiguous tensors)
-                k_contiguous, v_contiguous = kv_cache.get_kv_for_attention()
-                k_contiguous = k_contiguous.unsqueeze(0)  # Add batch dimension back
-                v_contiguous = v_contiguous.unsqueeze(0)
-
-                # Run attention
-                x = attention(roped_query, k_contiguous, v_contiguous)
-            else:
-                # Dict-based cache path (legacy)
-                assert grid_sizes.ndim == 1
-                frame_seqlen = math.prod(grid_sizes[1:]).item()
-                current_start_frame = current_start // frame_seqlen
-                roped_query = causal_rope_apply(
-                    q, grid_sizes, freqs, start_frame=current_start_frame).type_as(v)
-                roped_key = causal_rope_apply(
-                    k, grid_sizes, freqs, start_frame=current_start_frame).type_as(v)
-
-                current_end = current_start + roped_query.shape[1]
-                sink_tokens = self.sink_size * frame_seqlen
-
-                kv_cache_size = kv_cache["k"].shape[1]
-                num_new_tokens = roped_query.shape[1]
-
-                if (current_end > kv_cache["global_end_index"].item()) and (
-                        num_new_tokens + kv_cache["local_end_index"].item() > kv_cache_size):
-
-                    num_evicted_tokens = num_new_tokens + kv_cache["local_end_index"].item() - kv_cache_size
-                    num_rolled_tokens = kv_cache["local_end_index"].item() - num_evicted_tokens - sink_tokens
-                    kv_cache["k"][:, sink_tokens:sink_tokens + num_rolled_tokens] = \
-                        kv_cache["k"][:, sink_tokens + num_evicted_tokens:sink_tokens + num_evicted_tokens + num_rolled_tokens].clone()
-                    kv_cache["v"][:, sink_tokens:sink_tokens + num_rolled_tokens] = \
-                        kv_cache["v"][:, sink_tokens + num_evicted_tokens:sink_tokens + num_evicted_tokens + num_rolled_tokens].clone()
-                    # Insert the new keys/values at the end
-                    local_end_index = kv_cache["local_end_index"].item() + current_end - \
-                        kv_cache["global_end_index"].item() - num_evicted_tokens
-                    local_start_index = local_end_index - num_new_tokens
-                    kv_cache["k"][:, local_start_index:local_end_index] = roped_key
-                    kv_cache["v"][:, local_start_index:local_end_index] = v
-                else:
-                    # Assign new keys/values directly up to current_end
-                    local_end_index = kv_cache["local_end_index"].item() + current_end - kv_cache["global_end_index"].item()
-                    local_start_index = local_end_index - num_new_tokens
-
-                    kv_cache["k"][:, local_start_index:local_end_index] = roped_key
-                    kv_cache["v"][:, local_start_index:local_end_index] = v
-                x = attention(
-                    roped_query,
-                    kv_cache["k"][:, max(0, local_end_index - self.max_attention_size):local_end_index],
-                    kv_cache["v"][:, max(0, local_end_index - self.max_attention_size):local_end_index]
-                )
-                kv_cache["global_end_index"].fill_(current_end)
-                kv_cache["local_end_index"].fill_(local_end_index)
-
-        # output
-        x = x.flatten(2)
-        x = self.o(x)
-        return x
-
-
 class CausalWanAttentionBlock(nn.Module):
     """
     Transformer block with self-attention, cross-attention, optional action injection, and FFN.
@@ -303,8 +122,8 @@ class CausalWanAttentionBlock(nn.Module):
         self.norm2 = nn.LayerNorm(dim, eps, elementwise_affine=False)
         self.norm3 = nn.LayerNorm(dim, eps, elementwise_affine=True) if cross_attn_norm else nn.Identity()
 
-        # Attention layers
-        self.self_attn = CausalWanSelfAttention(dim, num_heads, local_attn_size, sink_size, qk_norm, eps)
+        # Attention layers - use FlashInferCausalSelfAttention directly
+        self.self_attn = FlashInferCausalSelfAttention(dim, num_heads, local_attn_size, sink_size, qk_norm, eps)
         self.cross_attn = WAN_CROSSATTENTION_CLASSES[cross_attn_type](
             dim, num_heads, (-1, -1), qk_norm, eps
         )
@@ -333,7 +152,7 @@ class CausalWanAttentionBlock(nn.Module):
         current_start: int = 0,
         cache_start: Optional[int] = None,
         action_context: Optional[ActionContext] = None,
-        planner: Optional["FlashInferPlanner"] = None,
+        planner: Optional[FlashInferPlanner] = None,
     ) -> torch.Tensor:
         r"""
         Forward pass through the attention block.
@@ -402,7 +221,7 @@ class CausalWanAttentionBlock(nn.Module):
         kv_cache,
         current_start: int,
         cache_start,
-        planner: Optional["FlashInferPlanner"] = None,
+        planner: Optional[FlashInferPlanner] = None,
     ) -> torch.Tensor:
         """
         Apply AdaLN-modulated self-attention with gated residual.
@@ -416,8 +235,7 @@ class CausalWanAttentionBlock(nn.Module):
                 x_norm.unflatten(dim=1, sizes=(num_frames, frame_seqlen)) * (1 + scale) + shift
             ).flatten(1, 2)
 
-            # Self-attention
-            # For FlashInferCausalSelfAttention, pass planner; for original, it's ignored
+            # FlashInfer self-attention
             y = self.self_attn(
                 x_modulated, seq_lens, grid_sizes, freqs, block_mask,
                 kv_cache, current_start, cache_start, planner=planner
@@ -971,11 +789,10 @@ class CausalWanModel(ModelMixin, ConfigMixin, FromOriginalModelMixin, PeftAdapte
         is_paged_cache = first_cache is not None and hasattr(first_cache, 'get_flashinfer_meta')
 
         if is_paged_cache:
-            # Import FlashInferPlanner and create planner for this generation step
-            from .flashinfer_attention import FlashInferPlanner, FLASHINFER_AVAILABLE
+            # Create FlashInferPlanner for this generation step
+            from .flashinfer_attention import FLASHINFER_AVAILABLE
             if FLASHINFER_AVAILABLE:
                 # Create planner with model parameters
-                # head_dim = dim // num_heads (CausalWanModel doesn't store head_dim directly)
                 head_dim = self.dim // self.num_heads
                 planner = FlashInferPlanner(
                     num_heads=self.num_heads,
