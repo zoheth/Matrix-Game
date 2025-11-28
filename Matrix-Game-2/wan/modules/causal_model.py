@@ -170,49 +170,85 @@ class CausalWanSelfAttention(nn.Module):
                 block_mask=block_mask
             )[:, :, :-padded_length].transpose(2, 1)
         else:
-            assert grid_sizes.ndim == 1
-            frame_seqlen = math.prod(grid_sizes[1:]).item()
-            current_start_frame = current_start // frame_seqlen
-            roped_query = causal_rope_apply(
-                q, grid_sizes, freqs, start_frame=current_start_frame).type_as(v)
-            roped_key = causal_rope_apply(
-                k, grid_sizes, freqs, start_frame=current_start_frame).type_as(v)
-                
-            current_end = current_start + roped_query.shape[1]
-            sink_tokens = self.sink_size * frame_seqlen
-           
-            kv_cache_size = kv_cache["k"].shape[1]
-            num_new_tokens = roped_query.shape[1]
-            
-            if (current_end > kv_cache["global_end_index"].item()) and (
-                    num_new_tokens + kv_cache["local_end_index"].item() > kv_cache_size):
-                    
-                num_evicted_tokens = num_new_tokens + kv_cache["local_end_index"].item() - kv_cache_size
-                num_rolled_tokens = kv_cache["local_end_index"].item() - num_evicted_tokens - sink_tokens
-                kv_cache["k"][:, sink_tokens:sink_tokens + num_rolled_tokens] = \
-                    kv_cache["k"][:, sink_tokens + num_evicted_tokens:sink_tokens + num_evicted_tokens + num_rolled_tokens].clone()
-                kv_cache["v"][:, sink_tokens:sink_tokens + num_rolled_tokens] = \
-                    kv_cache["v"][:, sink_tokens + num_evicted_tokens:sink_tokens + num_evicted_tokens + num_rolled_tokens].clone()
-                # Insert the new keys/values at the end
-                local_end_index = kv_cache["local_end_index"].item() + current_end - \
-                    kv_cache["global_end_index"].item() - num_evicted_tokens
-                local_start_index = local_end_index - num_new_tokens
-                kv_cache["k"][:, local_start_index:local_end_index] = roped_key
-                kv_cache["v"][:, local_start_index:local_end_index] = v
+            # Check if this is a PagedCache (new implementation)
+            from wan.modules.paged_cache import PagedCache
+            if isinstance(kv_cache, PagedCache):
+                # PagedCache path
+                assert grid_sizes.ndim == 1
+                assert b == 1, "PagedCache currently only supports batch size 1"
+
+                frame_seqlen = math.prod(grid_sizes[1:]).item()
+                current_start_frame = current_start // frame_seqlen
+                roped_query = causal_rope_apply(
+                    q, grid_sizes, freqs, start_frame=current_start_frame).type_as(v)
+                roped_key = causal_rope_apply(
+                    k, grid_sizes, freqs, start_frame=current_start_frame).type_as(v)
+
+                # Squeeze batch dimension for PagedCache (expects [seq_len, num_heads, head_dim])
+                roped_key_squeezed = roped_key.squeeze(0)
+                v_squeezed = v.squeeze(0)
+
+                # Calculate current_end
+                current_end = current_start + roped_key_squeezed.shape[0]
+
+                # Update cache: handles both denoising (overwrite) and new frames (append)
+                kv_cache.update_or_append(roped_key_squeezed, v_squeezed, current_start, current_end)
+
+                # Evict old pages if needed (sliding window)
+                kv_cache.evict(self.max_attention_size)
+
+                # Get K/V for attention (fallback to contiguous tensors)
+                k_contiguous, v_contiguous = kv_cache.get_kv_for_attention()
+                k_contiguous = k_contiguous.unsqueeze(0)  # Add batch dimension back
+                v_contiguous = v_contiguous.unsqueeze(0)
+
+                # Run attention
+                x = attention(roped_query, k_contiguous, v_contiguous)
             else:
-                # Assign new keys/values directly up to current_end
-                local_end_index = kv_cache["local_end_index"].item() + current_end - kv_cache["global_end_index"].item()
-                local_start_index = local_end_index - num_new_tokens
-                
-                kv_cache["k"][:, local_start_index:local_end_index] = roped_key
-                kv_cache["v"][:, local_start_index:local_end_index] = v
-            x = attention(
-                roped_query,
-                kv_cache["k"][:, max(0, local_end_index - self.max_attention_size):local_end_index],
-                kv_cache["v"][:, max(0, local_end_index - self.max_attention_size):local_end_index]
-            )
-            kv_cache["global_end_index"].fill_(current_end)
-            kv_cache["local_end_index"].fill_(local_end_index)
+                # Dict-based cache path (legacy)
+                assert grid_sizes.ndim == 1
+                frame_seqlen = math.prod(grid_sizes[1:]).item()
+                current_start_frame = current_start // frame_seqlen
+                roped_query = causal_rope_apply(
+                    q, grid_sizes, freqs, start_frame=current_start_frame).type_as(v)
+                roped_key = causal_rope_apply(
+                    k, grid_sizes, freqs, start_frame=current_start_frame).type_as(v)
+
+                current_end = current_start + roped_query.shape[1]
+                sink_tokens = self.sink_size * frame_seqlen
+
+                kv_cache_size = kv_cache["k"].shape[1]
+                num_new_tokens = roped_query.shape[1]
+
+                if (current_end > kv_cache["global_end_index"].item()) and (
+                        num_new_tokens + kv_cache["local_end_index"].item() > kv_cache_size):
+
+                    num_evicted_tokens = num_new_tokens + kv_cache["local_end_index"].item() - kv_cache_size
+                    num_rolled_tokens = kv_cache["local_end_index"].item() - num_evicted_tokens - sink_tokens
+                    kv_cache["k"][:, sink_tokens:sink_tokens + num_rolled_tokens] = \
+                        kv_cache["k"][:, sink_tokens + num_evicted_tokens:sink_tokens + num_evicted_tokens + num_rolled_tokens].clone()
+                    kv_cache["v"][:, sink_tokens:sink_tokens + num_rolled_tokens] = \
+                        kv_cache["v"][:, sink_tokens + num_evicted_tokens:sink_tokens + num_evicted_tokens + num_rolled_tokens].clone()
+                    # Insert the new keys/values at the end
+                    local_end_index = kv_cache["local_end_index"].item() + current_end - \
+                        kv_cache["global_end_index"].item() - num_evicted_tokens
+                    local_start_index = local_end_index - num_new_tokens
+                    kv_cache["k"][:, local_start_index:local_end_index] = roped_key
+                    kv_cache["v"][:, local_start_index:local_end_index] = v
+                else:
+                    # Assign new keys/values directly up to current_end
+                    local_end_index = kv_cache["local_end_index"].item() + current_end - kv_cache["global_end_index"].item()
+                    local_start_index = local_end_index - num_new_tokens
+
+                    kv_cache["k"][:, local_start_index:local_end_index] = roped_key
+                    kv_cache["v"][:, local_start_index:local_end_index] = v
+                x = attention(
+                    roped_query,
+                    kv_cache["k"][:, max(0, local_end_index - self.max_attention_size):local_end_index],
+                    kv_cache["v"][:, max(0, local_end_index - self.max_attention_size):local_end_index]
+                )
+                kv_cache["global_end_index"].fill_(current_end)
+                kv_cache["local_end_index"].fill_(local_end_index)
 
         # output
         x = x.flatten(2)
