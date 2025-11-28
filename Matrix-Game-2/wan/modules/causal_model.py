@@ -19,6 +19,7 @@ import torch.nn as nn
 import torch
 import math
 import os
+from einops import rearrange
 import torch.distributed as dist
 from typing import Optional, List, Dict
 
@@ -761,7 +762,8 @@ class CausalWanModel(ModelMixin, ConfigMixin, FromOriginalModelMixin, PeftAdapte
             # Use rearrange instead of transpose to ensure contiguous output
             # Old: x = x.flatten(2).transpose(1, 2) creates non-contiguous tensor with stride (B*C, 1, C)
             # New: contiguous reshape with stride (B*L*C, C, 1)
-            x = x.flatten(2).transpose(1, 2).contiguous() # B C FHW -> B FHW C (contiguous)
+            # x = x.flatten(2).transpose(1, 2).contiguous() # B C FHW -> B FHW C (contiguous)
+            x = rearrange(x, 'b c f h w -> b (f h w) c')
             seq_lens = torch.tensor([u.size(0) for u in x], dtype=torch.long)
             assert seq_lens[0] <= 15 * 1 * 880
 
@@ -893,7 +895,7 @@ class CausalWanModel(ModelMixin, ConfigMixin, FromOriginalModelMixin, PeftAdapte
         device = self.patch_embedding.weight.device
         if self.freqs.device != device:
             self.freqs = self.freqs.to(device)
-        x = torch.cat([x, cond_concat], dim=1)
+        # x = torch.cat([x, cond_concat], dim=1)
 
         # Get or create block masks (allows Pipeline to provide pre-computed masks)
         num_frames = x.shape[2]
