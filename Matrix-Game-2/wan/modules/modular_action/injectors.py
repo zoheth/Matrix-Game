@@ -1,4 +1,4 @@
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple, TYPE_CHECKING
 
 import torch
 from torch import nn
@@ -7,13 +7,16 @@ from einops import rearrange
 from wan.modules.modular_action.interfaces import (
     IAttentionInjector,
     IActionPreprocessor,
-    KVCacheManager,
     FlashInferAttentionCore,
     WanRMSNorm,
 )
 from wan.modules.modular_action.action_config import ActionConfig
 
 from .kernels.preprocessor_kernel import mouse_preprocessor_triton
+
+if TYPE_CHECKING:
+    from wan.modules.ring_buffer_action_cache import RingBufferActionCache
+
 # Note: Triton KV cache kernel disabled - PagedCache uses standard path
 
 class MousePreprocessor(IActionPreprocessor):
@@ -204,13 +207,11 @@ class MouseInjector(IAttentionInjector):
             action_config.mouse_hidden_dim, action_config.img_hidden_size, bias=action_config.qkv_bias
         )
 
-        # KV Cache manager
-        self.kv_cache_manager = KVCacheManager(
-            local_attn_size=action_config.local_attn_size, sink_size=0
-        )
-
         # Attention core
         self.attn_core = FlashInferAttentionCore()
+
+        # Cache configuration
+        self.max_attention_size = action_config.local_attn_size
 
     def forward(
         self,
@@ -220,7 +221,7 @@ class MouseInjector(IAttentionInjector):
         spatial_shape: Tuple[int, int],
         temporal_shape: int,
         is_causal: bool = False,
-        kv_cache: Optional[Dict[str, torch.Tensor]] = None,
+        kv_cache: Optional["RingBufferActionCache"] = None,
         start_frame: int = 0,
         num_frame_per_block: int = 1,
         block_mask: Optional[torch.Tensor] = None,
@@ -296,10 +297,15 @@ class MouseInjector(IAttentionInjector):
             # Apply RoPE using FlashInfer's integrated kernel (more efficient than external apply_rotary_emb)
             q_rope, k_rope = self.attn_core._apply_rope_internal(q, k, start_frame)
 
-            # Update KV cache and get window
-            k_window, v_window, _, _ = self.kv_cache_manager.update_cache(kv_cache, k_rope, v, num_frame_per_block)
-            # Compute attention with cached KV (RoPE already applied)
-            attn_output = self.attn_core(q_rope, k_window, v_window, causal=False, use_rope=False)
+            # Update KV cache and get window directly
+            k_window, v_window, kv_mask = kv_cache.update_and_get_window(
+                k=k_rope,
+                v=v,
+                num_new_tokens=num_frame_per_block,
+                max_attention_size=self.max_attention_size,
+            )
+            # Compute attention with cached KV (RoPE already applied, pass mask for padding handling)
+            attn_output = self.attn_core(q_rope, k_window, v_window, causal=False, use_rope=False, kv_mask=kv_mask)
         else:
             # Regular attention: use FlashInfer's integrated RoPE for best performance
             attn_output = self.attn_core(
@@ -366,13 +372,11 @@ class KeyboardInjector(IAttentionInjector):
             bias=action_config.qkv_bias,
         )
 
-        # KV Cache manager
-        self.kv_cache_manager = KVCacheManager(
-            local_attn_size=action_config.local_attn_size, sink_size=0
-        )
-
         # Attention core
         self.attn_core = FlashInferAttentionCore()
+
+        # Cache configuration
+        self.max_attention_size = action_config.local_attn_size
 
     def forward(
         self,
@@ -382,7 +386,7 @@ class KeyboardInjector(IAttentionInjector):
         spatial_shape: Tuple[int, int],
         temporal_shape: int,
         is_causal: bool = False,
-        kv_cache: Optional[Dict[str, torch.Tensor]] = None,
+        kv_cache: Optional["RingBufferActionCache"] = None,
         start_frame: int = 0,
         num_frame_per_block: int = 1,
         block_mask: Optional[torch.Tensor] = None,
@@ -397,7 +401,7 @@ class KeyboardInjector(IAttentionInjector):
             spatial_shape: (H, W) spatial dimensions
             temporal_shape: T temporal dimension
             is_causal: Whether to use causal attention
-            kv_cache: KV cache for incremental decoding
+            kv_cache: RingBufferActionCache for incremental decoding
             start_frame: Starting frame index for RoPE
             num_frame_per_block: Number of frames per block
             block_mask: Optional block mask
@@ -466,21 +470,21 @@ class KeyboardInjector(IAttentionInjector):
             k_rope_for_cache = k_rope_expanded.reshape(B * S, T_k, num_heads, head_dim)
             v_for_cache = v_expanded.reshape(B * S, T_k, num_heads, head_dim)
 
-            # Use standard KV cache update (supports PagedCache)
+            # Update KV cache directly
             # Note: Currently assumes B*S = 1, so we take [0] slice
-            k_window, v_window, _, _ = self.kv_cache_manager.update_cache(
-                kv_cache,
-                k_rope_for_cache[0:1],  # [1, T_k, H, D]
-                v_for_cache[0:1],       # [1, T_k, H, D]
+            k_window, v_window, kv_mask = kv_cache.update_and_get_window(
+                k=k_rope_for_cache[0:1],  # [1, T_k, H, D]
+                v=v_for_cache[0:1],       # [1, T_k, H, D]
                 num_new_tokens=T_k,
+                max_attention_size=self.max_attention_size,
             )
 
             # Expand window to all spatial locations: [1, window_len, H, D] -> [B*S, window_len, H, D]
             k_window = k_window.expand(B * S, -1, -1, -1)
             v_window = v_window.expand(B * S, -1, -1, -1)
 
-            # Compute attention with cached KV (RoPE already applied)
-            attn_output = self.attn_core(q_rope, k_window, v_window, causal=False, use_rope=False)
+            # Compute attention with cached KV (RoPE already applied, pass mask for padding handling)
+            attn_output = self.attn_core(q_rope, k_window, v_window, causal=False, use_rope=False, kv_mask=kv_mask)
         else:
             # Regular cross-attention
             # Expand K, V to match spatial dimension: [B, T_k, H, D] -> [B*S, T_k, H, D]

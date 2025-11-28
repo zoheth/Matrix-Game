@@ -14,6 +14,7 @@ import torch
 from pipeline.config import ModelConfig, CacheConfig
 from wan.modules.paged_cache import PagedCache, PagedCacheManager
 from wan.modules.action_cache import ActionCache
+from wan.modules.ring_buffer_action_cache import RingBufferActionCache
 
 
 class CacheManager:
@@ -56,8 +57,8 @@ class CacheManager:
 
         # Cache storage
         self.visual_cache: Optional[List[PagedCache]] = None
-        self.mouse_cache: Optional[List[ActionCache]] = None
-        self.keyboard_cache: Optional[List[ActionCache]] = None
+        self.mouse_cache: Optional[List[RingBufferActionCache]] = None
+        self.keyboard_cache: Optional[List[RingBufferActionCache]] = None
         self.crossattn_cache: Optional[List[Dict[str, torch.Tensor]]] = None
 
     def initialize_all_caches(self, batch_size: int = 1) -> None:
@@ -109,19 +110,21 @@ class CacheManager:
         return cache
 
 
-    def _create_action_mouse_cache(self, batch_size: int) -> List[ActionCache]:
+    def _create_action_mouse_cache(self, batch_size: int) -> List[RingBufferActionCache]:
         """
-        Create ActionCache for mouse action conditioning.
+        Create RingBufferActionCache for mouse action conditioning.
 
         Mouse self-attention uses spatial batching [B*S, T, H, D] where S is the
-        number of spatial tokens (frame_seq_length). ActionCache pre-allocates
+        number of spatial tokens (frame_seq_length). RingBufferActionCache pre-allocates
         memory for the full batch dimension.
+
+        Uses Ring Buffer for CUDA Graph compatibility.
 
         Args:
             batch_size: Base batch size (will be multiplied by spatial dimension)
 
         Returns:
-            List of ActionCache instances, one per transformer block
+            List of RingBufferActionCache instances, one per transformer block
         """
         # Mouse cache needs B * S where S is spatial dimension
         mouse_batch_size = batch_size * self.model_config.frame_seq_length
@@ -132,7 +135,7 @@ class CacheManager:
 
         cache = []
         for _ in range(self.model_config.num_transformer_blocks):
-            cache.append(ActionCache(
+            cache.append(RingBufferActionCache(
                 batch_size=mouse_batch_size,
                 max_seq_len=cache_size,
                 num_heads=num_heads,
@@ -143,18 +146,20 @@ class CacheManager:
 
         return cache
 
-    def _create_action_keyboard_cache(self, batch_size: int) -> List[ActionCache]:
+    def _create_action_keyboard_cache(self, batch_size: int) -> List[RingBufferActionCache]:
         """
-        Create ActionCache for keyboard action conditioning.
+        Create RingBufferActionCache for keyboard action conditioning.
 
         Keyboard self-attention uses simple batching [B, T, H, D].
-        ActionCache pre-allocates memory for the batch dimension.
+        RingBufferActionCache pre-allocates memory for the batch dimension.
+
+        Uses Ring Buffer for CUDA Graph compatibility.
 
         Args:
             batch_size: Batch size
 
         Returns:
-            List of ActionCache instances, one per transformer block
+            List of RingBufferActionCache instances, one per transformer block
         """
         cache_size = self.cache_config.get_action_cache_size()
         num_heads = self.model_config.num_action_attention_heads
@@ -162,7 +167,7 @@ class CacheManager:
 
         cache = []
         for _ in range(self.model_config.num_transformer_blocks):
-            cache.append(ActionCache(
+            cache.append(RingBufferActionCache(
                 batch_size=batch_size,
                 max_seq_len=cache_size,
                 num_heads=num_heads,
@@ -231,8 +236,8 @@ class CacheManager:
 
     def get_caches(self) -> tuple[
         List[PagedCache],
-        List[ActionCache],
-        List[ActionCache],
+        List[RingBufferActionCache],
+        List[RingBufferActionCache],
         List[Dict[str, torch.Tensor]]
     ]:
         """
@@ -241,8 +246,8 @@ class CacheManager:
         Returns:
             Tuple of (visual_cache, mouse_cache, keyboard_cache, crossattn_cache)
             - visual_cache: PagedCache instances (page-granular eviction)
-            - mouse_cache: ActionCache instances (token-level, spatial batching)
-            - keyboard_cache: ActionCache instances (token-level, simple batching)
+            - mouse_cache: RingBufferActionCache instances (ring buffer, spatial batching)
+            - keyboard_cache: RingBufferActionCache instances (ring buffer, simple batching)
             - crossattn_cache: Simple dict storage
         """
         if (self.visual_cache is None or self.mouse_cache is None or

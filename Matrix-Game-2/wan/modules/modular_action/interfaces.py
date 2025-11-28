@@ -50,7 +50,7 @@ class IAttentionInjector(nn.Module, ABC):
         pass
     
 class KVCacheManager(nn.Module):
-    """Manages KV cache with sliding window using PagedCache"""
+    """Manages KV cache with sliding window using ActionCache (legacy)"""
     def __init__(self, local_attn_size: int, sink_size: int = 0):
         super().__init__()
         self.max_attention_size = local_attn_size
@@ -58,16 +58,16 @@ class KVCacheManager(nn.Module):
 
     def update_cache(
         self,
-        kv_cache,  # PagedCache instance
+        kv_cache,  # ActionCache instance
         k: torch.Tensor,
         v: torch.Tensor,
         num_new_tokens: int
     ) -> Tuple[torch.Tensor, torch.Tensor, int, int]:
         """
-        Update PagedCache with new key-value pairs using sliding window strategy.
+        Update ActionCache with new key-value pairs using sliding window strategy.
 
         Args:
-            kv_cache: PagedCache instance
+            kv_cache: ActionCache instance
             k: New keys [BS, num_new_tokens, num_heads, head_dim]
             v: New values [BS, num_new_tokens, num_heads, head_dim]
             num_new_tokens: Number of new tokens to add
@@ -269,9 +269,10 @@ class FlashInferAttentionCore(IAttentionCore):
         causal: bool = False,
         use_rope: bool = False,
         rope_offset: Optional[int] = None,
+        kv_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
-        Compute attention using FlashInfer with optional integrated RoPE.
+        Compute attention using FlashInfer with optional integrated RoPE and KV masking.
 
         Args:
             q: [BS, seq_len_q, num_heads, head_dim] - Query tensor
@@ -280,6 +281,8 @@ class FlashInferAttentionCore(IAttentionCore):
             causal: Whether to apply causal masking
             use_rope: If True, apply RoPE internally using flashinfer (more efficient)
             rope_offset: Position offset for RoPE (only used when use_rope=True)
+            kv_mask: Optional [seq_len_k] boolean mask for KV pairs (True = valid, False = padding)
+                     Used for handling variable-length sequences with fixed-shape tensors
 
         Returns:
             Attention output [BS, seq_len_q, num_heads, head_dim]
@@ -289,6 +292,21 @@ class FlashInferAttentionCore(IAttentionCore):
 
         BS, seq_len_q, num_heads, head_dim = q.shape
         _, seq_len_kv, _, _ = k.shape
+
+        # Handle KV masking for variable-length sequences
+        # During cache warmup (prefill), kv_mask may have False values (padding)
+        # During steady-state decode with CUDA Graph, kv_mask should be all-True
+        if kv_mask is not None and not kv_mask.all():
+            # Mask has padding - compute valid length and slice
+            # WARNING: This path is NOT CUDA Graph compatible (dynamic slicing)
+            # Only use this during warmup/prefill, not during Graph capture
+            valid_kv_len_tensor = kv_mask.sum(dtype=torch.long)
+            valid_kv_len = int(valid_kv_len_tensor.item())
+
+            # Truncate k/v to valid length
+            k = k[:, :valid_kv_len]
+            v = v[:, :valid_kv_len]
+            seq_len_kv = valid_kv_len
 
         if BS == 1:
             # Single sequence - use single_prefill_with_kv_cache
