@@ -15,6 +15,7 @@ from pipeline.config import ModelConfig, CacheConfig
 from wan.modules.paged_cache import PagedCache, PagedCacheManager
 from wan.modules.action_cache import ActionCache
 from wan.modules.ring_buffer_action_cache import RingBufferActionCache
+from wan.modules.static_crossattn_cache import StaticCrossAttnCache
 
 
 class CacheManager:
@@ -23,12 +24,12 @@ class CacheManager:
 
     This class handles:
     - Visual self-attention cache (PagedCache for FlashInfer)
-    - Mouse action conditioning cache (ActionCache - supports spatial batching)
-    - Keyboard action conditioning cache (ActionCache - token-level eviction)
-    - Cross-attention cache (simple tensor storage)
+    - Mouse action conditioning cache (RingBufferActionCache - CUDA Graph compatible)
+    - Keyboard action conditioning cache (RingBufferActionCache - CUDA Graph compatible)
+    - Cross-attention cache (StaticCrossAttnCache - CUDA Graph compatible)
 
-    Visual cache uses PagedCache for page-granular operations with FlashInfer.
-    Action caches use ActionCache for token-level eviction with arbitrary batch sizes.
+    All caches are designed for CUDA Graph compatibility with pre-allocated memory
+    and GPU-only control flow.
     """
 
     def __init__(
@@ -59,7 +60,7 @@ class CacheManager:
         self.visual_cache: Optional[List[PagedCache]] = None
         self.mouse_cache: Optional[List[RingBufferActionCache]] = None
         self.keyboard_cache: Optional[List[RingBufferActionCache]] = None
-        self.crossattn_cache: Optional[List[Dict[str, torch.Tensor]]] = None
+        self.crossattn_cache: Optional[List[StaticCrossAttnCache]] = None
 
     def initialize_all_caches(self, batch_size: int = 1) -> None:
         """
@@ -178,15 +179,15 @@ class CacheManager:
 
         return cache
 
-    def _create_crossattn_cache(self, batch_size: int) -> List[Dict[str, torch.Tensor]]:
+    def _create_crossattn_cache(self, batch_size: int) -> List[StaticCrossAttnCache]:
         """
-        Create the cross-attention cache for visual context (CLIP features).
+        Create CUDA Graph-compatible static cross-attention cache.
 
         Args:
             batch_size: Batch size
 
         Returns:
-            List of cache dictionaries
+            List of StaticCrossAttnCache instances
         """
         seq_len = self.model_config.cross_attention_seq_length
         num_heads = self.model_config.num_attention_heads
@@ -194,19 +195,14 @@ class CacheManager:
 
         cache = []
         for _ in range(self.model_config.num_transformer_blocks):
-            cache.append({
-                "k": torch.zeros(
-                    [batch_size, seq_len, num_heads, head_dim],
-                    dtype=self.dtype,
-                    device=self.device
-                ),
-                "v": torch.zeros(
-                    [batch_size, seq_len, num_heads, head_dim],
-                    dtype=self.dtype,
-                    device=self.device
-                ),
-                "is_init": False
-            })
+            cache.append(StaticCrossAttnCache(
+                batch_size=batch_size,
+                seq_len=seq_len,
+                num_heads=num_heads,
+                head_dim=head_dim,
+                device=self.device,
+                dtype=self.dtype,
+            ))
 
         return cache
 
@@ -220,11 +216,10 @@ class CacheManager:
         if self.visual_cache is None:
             raise RuntimeError("Caches must be initialized before resetting")
 
-        # Reset cross-attention cache
+        # Reset all cache instances
         for block_cache in self.crossattn_cache:
-            block_cache["is_init"] = False
+            block_cache.reset()
 
-        # Reset all PagedCache instances
         for block_cache in self.visual_cache:
             block_cache.reset()
 
@@ -238,7 +233,7 @@ class CacheManager:
         List[PagedCache],
         List[RingBufferActionCache],
         List[RingBufferActionCache],
-        List[Dict[str, torch.Tensor]]
+        List[StaticCrossAttnCache]
     ]:
         """
         Get all caches.
@@ -248,7 +243,7 @@ class CacheManager:
             - visual_cache: PagedCache instances (page-granular eviction)
             - mouse_cache: RingBufferActionCache instances (ring buffer, spatial batching)
             - keyboard_cache: RingBufferActionCache instances (ring buffer, simple batching)
-            - crossattn_cache: Simple dict storage
+            - crossattn_cache: StaticCrossAttnCache instances (CUDA Graph compatible)
         """
         if (self.visual_cache is None or self.mouse_cache is None or
             self.keyboard_cache is None or self.crossattn_cache is None):

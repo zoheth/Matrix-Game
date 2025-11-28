@@ -232,29 +232,28 @@ class WanI2VCrossAttention(WanSelfAttention):
         Args:
             x(Tensor): Shape [B, L1, C]
             context(Tensor): Shape [B, L2, C]
-            context_lens(Tensor): Shape [B]
+            crossattn_cache: StaticCrossAttnCache instance or None
         """
         b, n, d = x.size(0), self.num_heads, self.head_dim
 
-        # compute query, key, value
+        # Compute query
         q = self.norm_q(self.q(x)).view(b, -1, n, d)
-        if crossattn_cache is not None:
-            if not crossattn_cache["is_init"]:
-                crossattn_cache["is_init"] = True
-                k = self.norm_k(self.k(context)).view(b, -1, n, d)
-                v = self.v(context).view(b, -1, n, d)
-                crossattn_cache["k"] = k
-                crossattn_cache["v"] = v
-            else:
-                k = crossattn_cache["k"]
-                v = crossattn_cache["v"]
+
+        # Compute or retrieve K/V from cache
+        if crossattn_cache is not None and hasattr(crossattn_cache, 'update_or_get'):
+            # New StaticCrossAttnCache API (CUDA Graph compatible)
+            k_new = self.norm_k(self.k(context)).view(b, -1, n, d)
+            v_new = self.v(context).view(b, -1, n, d)
+            k, v = crossattn_cache.update_or_get(k_new, v_new)
         else:
+            # No cache or legacy dict-based cache
             k = self.norm_k(self.k(context)).view(b, -1, n, d)
             v = self.v(context).view(b, -1, n, d)
-        # compute attention
+
+        # Compute attention
         x = flash_attention(q, k, v, k_lens=None)
 
-        # output
+        # Output projection
         x = x.flatten(2)
         x = self.o(x)
         return x
