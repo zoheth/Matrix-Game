@@ -15,7 +15,6 @@ from pipeline.config import ModelConfig, CacheConfig
 from wan.modules.paged_cache import PagedCache, PagedCacheManager
 from wan.modules.action_cache import ActionCache
 from wan.modules.ring_buffer_action_cache import RingBufferActionCache
-from wan.modules.static_crossattn_cache import StaticCrossAttnCache
 
 
 class CacheManager:
@@ -26,7 +25,8 @@ class CacheManager:
     - Visual self-attention cache (PagedCache for FlashInfer)
     - Mouse action conditioning cache (RingBufferActionCache - CUDA Graph compatible)
     - Keyboard action conditioning cache (RingBufferActionCache - CUDA Graph compatible)
-    - Cross-attention cache (StaticCrossAttnCache - CUDA Graph compatible)
+
+    Cross-attention cache is managed internally by WanI2VCrossAttention.
 
     All caches are designed for CUDA Graph compatibility with pre-allocated memory
     and GPU-only control flow.
@@ -60,7 +60,7 @@ class CacheManager:
         self.visual_cache: Optional[List[PagedCache]] = None
         self.mouse_cache: Optional[List[RingBufferActionCache]] = None
         self.keyboard_cache: Optional[List[RingBufferActionCache]] = None
-        self.crossattn_cache: Optional[List[StaticCrossAttnCache]] = None
+        # crossattn_cache no longer needed (managed internally by WanI2VCrossAttention)
 
     def initialize_all_caches(self, batch_size: int = 1) -> None:
         """
@@ -76,9 +76,6 @@ class CacheManager:
         # Action caches use ActionCache (supports arbitrary batch sizes)
         self.mouse_cache = self._create_action_mouse_cache(batch_size)
         self.keyboard_cache = self._create_action_keyboard_cache(batch_size)
-
-        # Cross-attention cache (simple dict storage)
-        self.crossattn_cache = self._create_crossattn_cache(batch_size)
 
     def _create_paged_visual_cache(self, batch_size: int) -> List[PagedCache]:
         """
@@ -179,33 +176,6 @@ class CacheManager:
 
         return cache
 
-    def _create_crossattn_cache(self, batch_size: int) -> List[StaticCrossAttnCache]:
-        """
-        Create CUDA Graph-compatible static cross-attention cache.
-
-        Args:
-            batch_size: Batch size
-
-        Returns:
-            List of StaticCrossAttnCache instances
-        """
-        seq_len = self.model_config.cross_attention_seq_length
-        num_heads = self.model_config.num_attention_heads
-        head_dim = self.model_config.head_dim
-
-        cache = []
-        for _ in range(self.model_config.num_transformer_blocks):
-            cache.append(StaticCrossAttnCache(
-                batch_size=batch_size,
-                seq_len=seq_len,
-                num_heads=num_heads,
-                head_dim=head_dim,
-                device=self.device,
-                dtype=self.dtype,
-            ))
-
-        return cache
-
     def reset_all_caches(self) -> None:
         """
         Reset all caches to their initial state.
@@ -217,9 +187,6 @@ class CacheManager:
             raise RuntimeError("Caches must be initialized before resetting")
 
         # Reset all cache instances
-        for block_cache in self.crossattn_cache:
-            block_cache.reset()
-
         for block_cache in self.visual_cache:
             block_cache.reset()
 
@@ -229,31 +196,33 @@ class CacheManager:
         for block_cache in self.keyboard_cache:
             block_cache.reset()
 
+        # Note: cross-attention cache is managed internally by WanI2VCrossAttention
+
     def get_caches(self) -> tuple[
         List[PagedCache],
         List[RingBufferActionCache],
         List[RingBufferActionCache],
-        List[StaticCrossAttnCache]
+        None
     ]:
         """
         Get all caches.
 
         Returns:
-            Tuple of (visual_cache, mouse_cache, keyboard_cache, crossattn_cache)
+            Tuple of (visual_cache, mouse_cache, keyboard_cache, None)
             - visual_cache: PagedCache instances (page-granular eviction)
             - mouse_cache: RingBufferActionCache instances (ring buffer, spatial batching)
             - keyboard_cache: RingBufferActionCache instances (ring buffer, simple batching)
-            - crossattn_cache: StaticCrossAttnCache instances (CUDA Graph compatible)
+            - crossattn_cache: None (managed internally by WanI2VCrossAttention)
         """
         if (self.visual_cache is None or self.mouse_cache is None or
-            self.keyboard_cache is None or self.crossattn_cache is None):
+            self.keyboard_cache is None):
             raise RuntimeError("Caches must be initialized before access")
 
         return (
             self.visual_cache,
             self.mouse_cache,
             self.keyboard_cache,
-            self.crossattn_cache
+            None  # cross-attention cache is now managed internally
         )
 
     def is_initialized(self) -> bool:

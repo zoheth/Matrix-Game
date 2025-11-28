@@ -319,7 +319,7 @@ class CUDAGraphCausalInference:
         # Precomputed resources
         self._static_timesteps: Dict[int, torch.Tensor] = {}
 
-    def _create_denoising_forward(self, kv_cache, kv_cache_mouse, kv_cache_keyboard, crossattn_cache):
+    def _create_denoising_forward(self, kv_cache, kv_cache_mouse, kv_cache_keyboard):
         """Create a forward function for the denoising step."""
         def forward(
             noisy_image_or_video: torch.Tensor,
@@ -346,7 +346,6 @@ class CUDAGraphCausalInference:
                 kv_cache=kv_cache,
                 kv_cache_mouse=kv_cache_mouse,
                 kv_cache_keyboard=kv_cache_keyboard,
-                crossattn_cache=crossattn_cache,
                 current_start=current_start,
             )
 
@@ -363,7 +362,6 @@ class CUDAGraphCausalInference:
         kv_cache: List[Dict],
         kv_cache_mouse: List[Dict],
         kv_cache_keyboard: List[Dict],
-        crossattn_cache: List[Dict],
     ) -> None:
         """
         Prepare CUDA Graphs for inference.
@@ -380,7 +378,6 @@ class CUDAGraphCausalInference:
             kv_cache: KV cache
             kv_cache_mouse: Mouse KV cache
             kv_cache_keyboard: Keyboard KV cache
-            crossattn_cache: Cross-attention cache
         """
         config = CUDAGraphConfig(
             batch_size=batch_size,
@@ -391,7 +388,7 @@ class CUDAGraphCausalInference:
 
         # Create forward function with bound caches
         forward_fn = self._create_denoising_forward(
-            kv_cache, kv_cache_mouse, kv_cache_keyboard, crossattn_cache
+            kv_cache, kv_cache_mouse, kv_cache_keyboard
         )
 
         # Create graph runner
@@ -475,7 +472,6 @@ class CUDAGraphSingleStepRunner:
         kv_cache: List[Dict],
         kv_cache_mouse: List[Dict],
         kv_cache_keyboard: List[Dict],
-        crossattn_cache: List[Dict],
         current_start: int,
     ) -> None:
         """
@@ -488,7 +484,6 @@ class CUDAGraphSingleStepRunner:
             kv_cache: KV cache (will be bound to graph)
             kv_cache_mouse: Mouse KV cache
             kv_cache_keyboard: Keyboard KV cache
-            crossattn_cache: Cross-attention cache
             current_start: Token start position (embedded in graph)
         """
         if self.is_captured:
@@ -509,7 +504,7 @@ class CUDAGraphSingleStepRunner:
             self._static_keyboard_cond = conditional_dict["keyboard_cond"].clone()
 
         # Store cache references and current_start
-        self._kv_caches = (kv_cache, kv_cache_mouse, kv_cache_keyboard, crossattn_cache)
+        self._kv_caches = (kv_cache, kv_cache_mouse, kv_cache_keyboard)
         self._captured_current_start = current_start
 
         # Build static conditional dict
@@ -533,7 +528,6 @@ class CUDAGraphSingleStepRunner:
                     kv_cache=kv_cache,
                     kv_cache_mouse=kv_cache_mouse,
                     kv_cache_keyboard=kv_cache_keyboard,
-                    crossattn_cache=crossattn_cache,
                     current_start=current_start,
                 )
         torch.cuda.synchronize()
@@ -550,7 +544,6 @@ class CUDAGraphSingleStepRunner:
                     kv_cache=kv_cache,
                     kv_cache_mouse=kv_cache_mouse,
                     kv_cache_keyboard=kv_cache_keyboard,
-                    crossattn_cache=crossattn_cache,
                     current_start=current_start,
                 )
 

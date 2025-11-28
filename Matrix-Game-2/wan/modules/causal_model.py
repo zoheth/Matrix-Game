@@ -149,7 +149,6 @@ class CausalWanAttentionBlock(nn.Module):
         context: torch.Tensor,
         block_mask: BlockMask,
         kv_cache: Optional[dict] = None,
-        crossattn_cache: Optional[dict] = None,
         current_start: int = 0,
         cache_start: Optional[int] = None,
         action_context: Optional[ActionContext] = None,
@@ -167,7 +166,6 @@ class CausalWanAttentionBlock(nn.Module):
             context: Visual context for cross-attention
             block_mask: Attention mask for self-attention
             kv_cache: KV cache for self-attention
-            crossattn_cache: Cache for cross-attention
             current_start: Current position in sequence (for cache indexing)
             cache_start: Start position of cache
             action_context: Optional ActionContext encapsulating all action-related parameters
@@ -201,8 +199,7 @@ class CausalWanAttentionBlock(nn.Module):
         x = self._apply_cross_attn_and_ffn(
             x, context, shift_ffn, scale_ffn, gate_ffn,
             num_frames, frame_seqlen, grid_sizes,
-            crossattn_cache, current_start,
-            action_context
+            current_start, action_context
         )
 
         return x
@@ -257,7 +254,6 @@ class CausalWanAttentionBlock(nn.Module):
         num_frames: int,
         frame_seqlen: int,
         grid_sizes: torch.Tensor,
-        crossattn_cache,
         current_start: int,
         action_context: Optional[ActionContext]
     ) -> torch.Tensor:
@@ -273,8 +269,7 @@ class CausalWanAttentionBlock(nn.Module):
         with torch.profiler.record_function("CausalWanAttentionBlock/cross_attn"):
             x = x + self.cross_attn(
                 self.norm3(x.to(context.dtype)),
-                context,
-                crossattn_cache=crossattn_cache
+                context
             )
 
         # Optional action module
@@ -493,6 +488,11 @@ class CausalWanModel(ModelMixin, ConfigMixin, FromOriginalModelMixin, PeftAdapte
 
     def _set_gradient_checkpointing(self, module, value=False):
         self.gradient_checkpointing = value
+
+    def reset_crossattn_cache(self):
+        """Reset cross-attention cache in all blocks."""
+        for block in self.blocks:
+            block.cross_attn.reset_cache()
 
     def _get_or_create_masks(
         self,
@@ -717,7 +717,6 @@ class CausalWanModel(ModelMixin, ConfigMixin, FromOriginalModelMixin, PeftAdapte
         kv_cache: dict = None,
         kv_cache_mouse: Optional[List[dict]] = None,
         kv_cache_keyboard: Optional[List[dict]] = None,
-        crossattn_cache: dict = None,
         current_start: int = 0,
         cache_start: int = 0
     ):
@@ -845,7 +844,6 @@ class CausalWanModel(ModelMixin, ConfigMixin, FromOriginalModelMixin, PeftAdapte
                     else:
                         kwargs.update({
                             "kv_cache": kv_cache[block_index],
-                            "crossattn_cache": crossattn_cache[block_index],
                             "current_start": current_start,
                             "cache_start": cache_start,
                             "planner": planner,

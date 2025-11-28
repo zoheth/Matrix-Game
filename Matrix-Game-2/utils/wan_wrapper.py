@@ -99,7 +99,6 @@ class WanDiffusionWrapper(torch.nn.Module):
         kv_cache: Optional[List[dict]] = None,
         kv_cache_mouse: Optional[List[dict]] = None,
         kv_cache_keyboard: Optional[List[dict]] = None,
-        crossattn_cache: Optional[List[dict]] = None,
         current_start: Optional[int] = None,
         cache_start: Optional[int] = None
     ) -> torch.Tensor:
@@ -142,7 +141,6 @@ class WanDiffusionWrapper(torch.nn.Module):
                     kv_cache=kv_cache,
                     kv_cache_mouse=kv_cache_mouse,
                     kv_cache_keyboard=kv_cache_keyboard,
-                    crossattn_cache=crossattn_cache,
                     current_start=current_start,
                     cache_start=cache_start
                 )

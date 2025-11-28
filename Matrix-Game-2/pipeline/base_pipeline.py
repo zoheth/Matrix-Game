@@ -119,6 +119,8 @@ class BaseCausalInferencePipeline(torch.nn.Module, ABC):
         else:
             # Already initialized, just reset
             self.cache_manager.reset_all_caches()
+            # Reset cross-attention cache (managed internally by model)
+            self.generator.model.reset_crossattn_cache()
 
     def _initialize_vae_cache(self):
         """
@@ -166,7 +168,7 @@ class BaseCausalInferencePipeline(torch.nn.Module, ABC):
         timestep = torch.zeros([batch_size, 1], device=self.device, dtype=torch.int64)
         current_start = 0
 
-        visual_cache, mouse_cache, keyboard_cache, crossattn_cache = self.cache_manager.get_caches()
+        visual_cache, mouse_cache, keyboard_cache, _ = self.cache_manager.get_caches()
 
         for _ in range(num_input_blocks):
             current_block = initial_latent[
@@ -189,7 +191,6 @@ class BaseCausalInferencePipeline(torch.nn.Module, ABC):
                 kv_cache=visual_cache,
                 kv_cache_mouse=mouse_cache,
                 kv_cache_keyboard=keyboard_cache,
-                crossattn_cache=crossattn_cache,
                 current_start=current_start * self.config.model.frame_seq_length
             )
 
@@ -217,7 +218,7 @@ class BaseCausalInferencePipeline(torch.nn.Module, ABC):
             Denoised latent
         """
         current_num_frames = noisy_input.shape[2]
-        visual_cache, mouse_cache, keyboard_cache, crossattn_cache = self.cache_manager.get_caches()
+        visual_cache, mouse_cache, keyboard_cache, _ = self.cache_manager.get_caches()
         current_start = current_start_frame * self.config.model.frame_seq_length
 
         # Initialize CUDA Graph if enabled and not yet captured for this start position
@@ -247,7 +248,6 @@ class BaseCausalInferencePipeline(torch.nn.Module, ABC):
                     visual_cache=visual_cache,
                     mouse_cache=mouse_cache,
                     keyboard_cache=keyboard_cache,
-                    crossattn_cache=crossattn_cache,
                     current_start=current_start,
                 )
             else:
@@ -258,7 +258,6 @@ class BaseCausalInferencePipeline(torch.nn.Module, ABC):
                     kv_cache=visual_cache,
                     kv_cache_mouse=mouse_cache,
                     kv_cache_keyboard=keyboard_cache,
-                    crossattn_cache=crossattn_cache,
                     current_start=current_start,
                 )
 
@@ -304,10 +303,9 @@ class BaseCausalInferencePipeline(torch.nn.Module, ABC):
         noisy_input: torch.Tensor,
         timestep: torch.Tensor,
         conditional_dict: Dict[str, torch.Tensor],
-        visual_cache: List[Dict],
-        mouse_cache: List[Dict],
-        keyboard_cache: List[Dict],
-        crossattn_cache: List[Dict],
+        visual_cache: List,
+        mouse_cache: List,
+        keyboard_cache: List,
         current_start: int,
     ):
         """Run forward pass using CUDA Graph."""
@@ -324,7 +322,6 @@ class BaseCausalInferencePipeline(torch.nn.Module, ABC):
                 kv_cache=visual_cache,
                 kv_cache_mouse=mouse_cache,
                 kv_cache_keyboard=keyboard_cache,
-                crossattn_cache=crossattn_cache,
                 current_start=current_start,
             )
             self._cuda_graph_captured_start = current_start
@@ -355,7 +352,7 @@ class BaseCausalInferencePipeline(torch.nn.Module, ABC):
             dtype=torch.int64
         ) * self.config.inference.context_noise
 
-        visual_cache, mouse_cache, keyboard_cache, crossattn_cache = self.cache_manager.get_caches()
+        visual_cache, mouse_cache, keyboard_cache, _ = self.cache_manager.get_caches()
 
         self.generator(
             noisy_image_or_video=denoised_pred,
@@ -364,7 +361,6 @@ class BaseCausalInferencePipeline(torch.nn.Module, ABC):
             kv_cache=visual_cache,
             kv_cache_mouse=mouse_cache,
             kv_cache_keyboard=keyboard_cache,
-            crossattn_cache=crossattn_cache,
             current_start=current_start_frame * self.config.model.frame_seq_length
         )
 
