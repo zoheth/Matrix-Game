@@ -229,10 +229,13 @@ class CausalWanAttentionBlock(nn.Module):
                 x_norm.unflatten(dim=1, sizes=(num_frames, frame_seqlen)) * (1 + scale) + shift
             ).flatten(1, 2)
 
-            # CausalSelfAttention (grid_sizes is now a tuple!)
             y = self.self_attn(
-                x_modulated, grid_sizes, freqs, block_mask,
-                kv_cache, current_start, planner=planner
+                x_modulated,
+                grid_sizes,
+                freqs,
+                kv_cache,
+                current_start,
+                planner,
             )
 
             # Gated residual
@@ -777,16 +780,12 @@ class CausalWanModel(ModelMixin, ConfigMixin, FromOriginalModelMixin, PeftAdapte
         is_paged_cache = first_cache is not None and hasattr(first_cache, 'get_flashinfer_meta')
 
         if is_paged_cache:
-            # Create FlashInferPlanner for this generation step
-            from .flashinfer_attention import FLASHINFER_AVAILABLE
-            if FLASHINFER_AVAILABLE:
-                # Create planner with model parameters
-                head_dim = self.dim // self.num_heads
-                planner = FlashInferPlanner(
-                    num_heads=self.num_heads,
-                    head_dim=head_dim,
-                    page_size=first_cache.page_size,
-                )
+            head_dim = self.dim // self.num_heads
+            planner = FlashInferPlanner(
+                num_heads=self.num_heads,
+                head_dim=head_dim,
+                page_size=first_cache.page_size,
+            )
 
         with torch.profiler.record_function("CausalWanModel/transformer_blocks"):
             for block_index, block in enumerate(self.blocks):

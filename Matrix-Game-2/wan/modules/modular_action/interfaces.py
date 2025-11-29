@@ -11,13 +11,7 @@ if TYPE_CHECKING:
     import flashinfer
     from wan.modules.action_cache import ActionCache
 
-try:
-    import flashinfer
-    FLASHINFER_AVAILABLE = True
-except ImportError:
-    FLASHINFER_AVAILABLE = False
-    flashinfer = None  # type: ignore
-    print("Warning: flashinfer not available, falling back to flash_attn")
+import flashinfer
 
 class IActionPreprocessor(nn.Module, ABC):
     """ (B, N_frames, C) -> (B, T_q_or_k, C_windowed)"""
@@ -175,9 +169,6 @@ class FlashInferAttentionCore(IAttentionCore):
         Returns:
             Tuple of rotated (q, k) tensors with same shapes
         """
-        if not FLASHINFER_AVAILABLE:
-            raise RuntimeError("flashinfer is not available. Please install it first.")
-
         BS_q, seq_len_q, num_heads, head_dim = q.shape
         BS_k, seq_len_k, _, _ = k.shape
 
@@ -229,9 +220,6 @@ class FlashInferAttentionCore(IAttentionCore):
         Returns:
             Rotated tensor with same shape
         """
-        if not FLASHINFER_AVAILABLE:
-            raise RuntimeError("flashinfer is not available. Please install it first.")
-
         BS, seq_len, num_heads, head_dim = x.shape
 
         # Flatten to ragged format: [BS, L, H, D] -> [BS*L, H, D]
@@ -287,9 +275,6 @@ class FlashInferAttentionCore(IAttentionCore):
         Returns:
             Attention output [BS, seq_len_q, num_heads, head_dim]
         """
-        if not FLASHINFER_AVAILABLE:
-            raise RuntimeError("flashinfer is not available. Please install it first.")
-
         BS, seq_len_q, num_heads, head_dim = q.shape
         _, seq_len_kv, _, _ = k.shape
 
