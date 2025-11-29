@@ -9,7 +9,7 @@ from wan.modules.model import (
     sinusoidal_embedding_1d
 )
 from wan.modules.action_context import ActionContext, BlockMaskFactory
-from wan.modules.flashinfer_attention import FlashInferCausalSelfAttention, FlashInferPlanner
+from wan.modules.flashinfer_attention import CausalSelfAttention, FlashInferPlanner
 from diffusers.loaders import FromOriginalModelMixin, PeftAdapterMixin
 from torch.nn.attention.flex_attention import create_block_mask, flex_attention
 from diffusers.configuration_utils import ConfigMixin, register_to_config
@@ -123,8 +123,8 @@ class CausalWanAttentionBlock(nn.Module):
         self.norm2 = nn.LayerNorm(dim, eps, elementwise_affine=False)
         self.norm3 = nn.LayerNorm(dim, eps, elementwise_affine=True) if cross_attn_norm else nn.Identity()
 
-        # Attention layers - use FlashInferCausalSelfAttention directly
-        self.self_attn = FlashInferCausalSelfAttention(dim, num_heads, local_attn_size, sink_size, qk_norm, eps)
+        # Attention layers - use CausalSelfAttention directly
+        self.self_attn = CausalSelfAttention(dim, num_heads, local_attn_size, sink_size, qk_norm, eps)
         self.cross_attn = WAN_CROSSATTENTION_CLASSES[cross_attn_type](
             dim, num_heads, (-1, -1), qk_norm, eps
         )
@@ -143,14 +143,12 @@ class CausalWanAttentionBlock(nn.Module):
         self,
         x: torch.Tensor,
         ada_params: torch.Tensor,
-        seq_lens: torch.Tensor,
-        grid_sizes: torch.Tensor,
+        grid_sizes: tuple,
         freqs: torch.Tensor,
         context: torch.Tensor,
         block_mask: BlockMask,
         kv_cache: Optional[dict] = None,
         current_start: int = 0,
-        cache_start: Optional[int] = None,
         action_context: Optional[ActionContext] = None,
         planner: Optional[FlashInferPlanner] = None,
     ) -> torch.Tensor:
@@ -160,21 +158,21 @@ class CausalWanAttentionBlock(nn.Module):
         Args:
             x: Hidden states [B, L, C]
             ada_params: AdaLN modulation parameters [B, F, 6, C] where F = num_frames
-            seq_lens: Sequence lengths [B]
-            grid_sizes: Spatial-temporal grid [3] = (num_frames, height, width)
+            grid_sizes: Spatial-temporal grid (num_frames, height, width) as tuple
             freqs: RoPE frequencies [max_len, head_dim/2]
             context: Visual context for cross-attention
             block_mask: Attention mask for self-attention
             kv_cache: KV cache for self-attention
             current_start: Current position in sequence (for cache indexing)
-            cache_start: Start position of cache
             action_context: Optional ActionContext encapsulating all action-related parameters
+            planner: FlashInferPlanner (must be pre-planned before calling)
 
         Returns:
             Updated hidden states [B, L, C]
         """
         assert ada_params.ndim == 4, f"Expected ada_params.ndim=4, got {ada_params.ndim}"
-        assert grid_sizes.ndim == 1, f"Expected grid_sizes.ndim=1 for inference, got {grid_sizes.ndim}"
+        assert isinstance(grid_sizes, tuple) and len(grid_sizes) == 3, \
+            f"Expected grid_sizes to be tuple of length 3, got {type(grid_sizes)}"
 
         L = x.shape[1]
         num_frames = ada_params.shape[1]
@@ -191,8 +189,8 @@ class CausalWanAttentionBlock(nn.Module):
         x = self._apply_self_attention(
             x, shift_msa, scale_msa, gate_msa,
             num_frames, frame_seqlen,
-            seq_lens, grid_sizes, freqs, block_mask,
-            kv_cache, current_start, cache_start, planner
+            grid_sizes, freqs, block_mask,
+            kv_cache, current_start, planner
         )
 
         # ==================== Cross-Attention + Action + FFN Block ====================
@@ -212,13 +210,11 @@ class CausalWanAttentionBlock(nn.Module):
         gate: torch.Tensor,
         num_frames: int,
         frame_seqlen: int,
-        seq_lens: torch.Tensor,
-        grid_sizes: torch.Tensor,
+        grid_sizes: tuple,  # (F, H, W)
         freqs: torch.Tensor,
         block_mask,
         kv_cache,
         current_start: int,
-        cache_start,
         planner: Optional[FlashInferPlanner] = None,
     ) -> torch.Tensor:
         """
@@ -233,10 +229,10 @@ class CausalWanAttentionBlock(nn.Module):
                 x_norm.unflatten(dim=1, sizes=(num_frames, frame_seqlen)) * (1 + scale) + shift
             ).flatten(1, 2)
 
-            # FlashInfer self-attention
+            # CausalSelfAttention (grid_sizes is now a tuple!)
             y = self.self_attn(
-                x_modulated, seq_lens, grid_sizes, freqs, block_mask,
-                kv_cache, current_start, cache_start, planner=planner
+                x_modulated, grid_sizes, freqs, block_mask,
+                kv_cache, current_start, planner=planner
             )
 
             # Gated residual
@@ -253,7 +249,7 @@ class CausalWanAttentionBlock(nn.Module):
         gate: torch.Tensor,
         num_frames: int,
         frame_seqlen: int,
-        grid_sizes: torch.Tensor,
+        grid_sizes: tuple,  # (F, H, W)
         current_start: int,
         action_context: Optional[ActionContext]
     ) -> torch.Tensor:
@@ -757,14 +753,11 @@ class CausalWanModel(ModelMixin, ConfigMixin, FromOriginalModelMixin, PeftAdapte
         # embeddings
         with torch.profiler.record_function("CausalWanModel/patch_embedding"):
             x = self.patch_embedding(x)
-            grid_sizes = torch.tensor(x.shape[2:], dtype=torch.long)
-            # Use rearrange instead of transpose to ensure contiguous output
-            # Old: x = x.flatten(2).transpose(1, 2) creates non-contiguous tensor with stride (B*C, 1, C)
-            # New: contiguous reshape with stride (B*L*C, C, 1)
-            # x = x.flatten(2).transpose(1, 2).contiguous() # B C FHW -> B FHW C (contiguous)
+            # grid_sizes is now a simple tuple (F, H, W)
+            grid_sizes = tuple(x.shape[2:])
+            # Use rearrange for contiguous output
             x = rearrange(x, 'b c f h w -> b (f h w) c')
-            seq_lens = torch.tensor([u.size(0) for u in x], dtype=torch.long)
-            assert seq_lens[0] <= 15 * 1 * 880
+            assert x.shape[1] <= 15 * 1 * 880
 
         with torch.profiler.record_function("CausalWanModel/time_embedding"):
             e = self.time_embedding(
@@ -804,7 +797,6 @@ class CausalWanModel(ModelMixin, ConfigMixin, FromOriginalModelMixin, PeftAdapte
         # arguments
         kwargs = dict(
             ada_params=e0,
-            seq_lens=seq_lens,
             grid_sizes=grid_sizes,
             freqs=self.freqs,
             context=context,
@@ -825,15 +817,10 @@ class CausalWanModel(ModelMixin, ConfigMixin, FromOriginalModelMixin, PeftAdapte
                         action_context.kv_cache_mouse = kv_cache_mouse[block_index] if kv_cache_mouse else None
                         action_context.kv_cache_keyboard = kv_cache_keyboard[block_index] if kv_cache_keyboard else None
 
-                    # Note: FlashInfer plan is executed lazily in the first attention layer
-                    # (inside _forward_incremental_paged) after cache is updated.
-                    # All subsequent layers reuse the same plan.
-
                     if torch.is_grad_enabled() and self.gradient_checkpointing:
                         kwargs.update({
                             "kv_cache": kv_cache[block_index],
                             "current_start": current_start,
-                            "cache_start": cache_start,
                             "planner": planner,
                         })
                         x = torch.utils.checkpoint.checkpoint(
@@ -845,7 +832,6 @@ class CausalWanModel(ModelMixin, ConfigMixin, FromOriginalModelMixin, PeftAdapte
                         kwargs.update({
                             "kv_cache": kv_cache[block_index],
                             "current_start": current_start,
-                            "cache_start": cache_start,
                             "planner": planner,
                         })
                         x = block(x, **kwargs)
@@ -910,10 +896,10 @@ class CausalWanModel(ModelMixin, ConfigMixin, FromOriginalModelMixin, PeftAdapte
         )
 
         x = self.patch_embedding(x)
-        grid_sizes = torch.tensor(x.shape[2:], dtype=torch.long)
+        # grid_sizes is now a simple tuple (F, H, W)
+        grid_sizes = tuple(x.shape[2:])
         # Ensure contiguous output after transpose
         x = x.flatten(2).transpose(1, 2).contiguous()
-        seq_lens = torch.tensor([u.size(0) for u in x], dtype=torch.long)
         e = self.time_embedding(
             sinusoidal_embedding_1d(self.freq_dim, t.flatten()).type_as(x))
         e0 = self.time_projection(e).unflatten(
@@ -930,13 +916,12 @@ class CausalWanModel(ModelMixin, ConfigMixin, FromOriginalModelMixin, PeftAdapte
         # arguments
         kwargs = dict(
             ada_params=e0,
-            seq_lens=seq_lens,
             grid_sizes=grid_sizes,
             freqs=self.freqs,
             context=context,
             block_mask=block_mask,
             action_context=action_context
-            )
+        )
 
         def create_custom_forward(module):
             def custom_forward(*inputs, **kwargs):

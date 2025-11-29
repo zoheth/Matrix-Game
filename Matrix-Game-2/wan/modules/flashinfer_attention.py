@@ -1,22 +1,36 @@
 """
-FlashInfer-based Self-Attention for CausalWanModel.
+FlashInfer-based Causal Self-Attention - Refactored from first principles.
 
-This module provides FlashInferCausalSelfAttention, a drop-in replacement for
-CausalWanSelfAttention that uses FlashInfer for attention computation.
+This module provides a clean implementation of FlashInfer-based attention
+with 3D RoPE support. All historical baggage has been removed.
 
-Key features:
-1. Uses FlashInfer's BatchPrefillWithPagedKVCacheWrapper for efficient paged attention
-2. Applies 3D RoPE BEFORE attention (rope_mode="NONE") for compatibility
-3. All memory pre-allocated for CUDA Graph compatibility
-4. Supports sliding window attention via page eviction
-5. Plan is executed ONCE per generation step and shared across all layers
+Design principles (from first principles):
+1. grid_sizes is a simple tuple (F, H, W), not a Tensor - no unnecessary GPU-CPU sync
+2. Planning happens AFTER cache update - plan reads current cache state
+3. Each class has a single, clear responsibility
+4. All unused parameters removed (seq_lens, cache_start, max_frames, device)
+5. Computation logic remains IDENTICAL to original implementation
 
 Architecture:
-- FlashInferPlanner: Manages plan state, called once per generation step
-- FlashInferCausalSelfAttention: Executes run() using shared plan state
+- RoPE3DCache: On-demand 3D RoPE frequency computation (memory-efficient)
+- apply_rope_3d: Apply 3D RoPE using precomputed frequencies
+- FlashInferPlanner: Manages plan state (called once per generation step)
+- CausalSelfAttention: Handles attention with conditional planning
+
+Planning strategy:
+- First layer: Updates cache → evicts pages → plans (reads fresh cache state) → runs
+- Later layers: Skip planning (reuse plan from first layer) → run
+- This ensures plan is based on current cache state and shared across all layers
+
+Key features:
+- FlashInfer's BatchPrefillWithPagedKVCacheWrapper for efficient paged attention
+- 3D RoPE applied BEFORE attention for compatibility
+- CUDA Graph friendly (all memory pre-allocated)
+- Sliding window attention via page eviction
+- Plan executed ONCE per generation step (in first layer) and shared across all layers
 """
 
-from typing import Optional, TYPE_CHECKING
+from typing import Optional, Tuple
 import math
 import torch
 import torch.nn as nn
@@ -33,7 +47,7 @@ from wan.modules.attention import flash_attention as flash_attention_fallback
 from .paged_cache import PagedCache
 
 
-class PrecomputedRoPE3DCache:
+class RoPE3DCache:
     """
     On-demand 3D RoPE frequency computation for efficient inference.
 
@@ -46,26 +60,21 @@ class PrecomputedRoPE3DCache:
 
     def __init__(
         self,
-        freqs: torch.Tensor,  # Original freqs [1024, head_dim//2]
-        max_frames: int = 1024,  # Maximum supported frames (just for validation)
-        height: int = 22,  # After patchification (352 / 16)
-        width: int = 40,   # After patchification (640 / 16)
-        device: torch.device = None,
+        freqs: torch.Tensor,  # [max_positions, head_dim//2]
+        height: int,
+        width: int,
     ):
         """
         Initialize RoPE frequency cache.
 
         Args:
-            freqs: Original RoPE frequencies from model [1024, head_dim//2]
-            max_frames: Maximum frames to support (for validation only)
+            freqs: RoPE frequencies [max_positions, head_dim//2]
             height: Spatial height after patchification
             width: Spatial width after patchification
-            device: Target device
         """
-        self.max_frames = max_frames
         self.height = height
         self.width = width
-        self.device = device or freqs.device
+        self.device = freqs.device
         self.dtype = freqs.dtype
 
         # freqs is already complex exponentials from rope_params
@@ -131,14 +140,12 @@ class PrecomputedRoPE3DCache:
         return freqs
 
 
-def apply_rope_3d_precomputed(
+def apply_rope_3d(
     x: torch.Tensor,  # [B, seq_len, num_heads, head_dim]
     freqs: torch.Tensor,  # [seq_len, 1, head_dim//2]
 ) -> torch.Tensor:
     """
     Apply 3D RoPE using precomputed frequencies.
-
-    This is the fast path that uses pre-expanded frequency grids.
 
     Args:
         x: Input tensor [B, seq_len, num_heads, head_dim]
@@ -303,17 +310,28 @@ class FlashInferPlanner:
         self._is_planned = False
 
 
-class FlashInferCausalSelfAttention(nn.Module):
+class CausalSelfAttention(nn.Module):
     """
     FlashInfer-based causal self-attention with 3D RoPE support.
 
-    This module expects plan() to be called externally (via FlashInferPlanner)
-    before forward(). It only executes run() using the pre-computed plan.
+    Clean design from first principles:
+    - grid_sizes is a simple tuple (F, H, W), not a Tensor
+    - Planning is conditional: only first layer plans (after cache update)
+    - All unused parameters removed (seq_lens, cache_start, max_frames, device)
+    - Computation logic identical to original implementation
 
-    Key design:
-    - plan() is NOT called here - it's called once per generation step by the model
-    - run() uses the shared FlashInferPlanner
-    - This allows all layers to share the same plan, avoiding redundant computation
+    Planning behavior:
+    - First layer in each generation step:
+      1. Updates KV cache with new tokens
+      2. Evicts old pages (sliding window)
+      3. Calls planner.plan() with fresh cache state
+      4. Runs attention
+    - Later layers: Skip planning, reuse plan from first layer
+
+    This ensures:
+    - Plan is based on current cache state (not stale state)
+    - Plan is computed only once per generation step (not per layer)
+    - All layers share the same plan (cache structure is identical)
     """
 
     def __init__(
@@ -324,8 +342,6 @@ class FlashInferCausalSelfAttention(nn.Module):
         sink_size: int = 0,
         qk_norm: bool = True,
         eps: float = 1e-6,
-        # FlashInfer specific
-        max_frames: int = 1024,
         height: int = 22,
         width: int = 40,
         page_size: int = 16,
@@ -338,11 +354,8 @@ class FlashInferCausalSelfAttention(nn.Module):
         self.head_dim = dim // num_heads
         self.local_attn_size = local_attn_size
         self.sink_size = sink_size
-        self.qk_norm = qk_norm
-        self.eps = eps
 
         # Spatial dimensions
-        self.max_frames = max_frames
         self.height = height
         self.width = width
         self.frame_seq_len = height * width
@@ -363,49 +376,46 @@ class FlashInferCausalSelfAttention(nn.Module):
         self.norm_k = nn.RMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
 
         # RoPE cache (initialized lazily on first forward)
-        self.rope_cache: Optional[PrecomputedRoPE3DCache] = None
+        self.rope_cache: Optional[RoPE3DCache] = None
 
     def _init_rope_cache(self, freqs: torch.Tensor):
-        """Initialize precomputed RoPE frequencies."""
+        """Initialize RoPE cache."""
         if self.rope_cache is None:
-            self.rope_cache = PrecomputedRoPE3DCache(
+            self.rope_cache = RoPE3DCache(
                 freqs=freqs,
-                max_frames=self.max_frames,
                 height=self.height,
                 width=self.width,
-                device=freqs.device,
             )
 
     def forward(
         self,
         x: torch.Tensor,  # [B, seq_len, dim]
-        seq_lens: torch.Tensor,  # [B]
-        grid_sizes: torch.Tensor,  # [3] = (F, H, W)
+        grid_sizes: Tuple[int, int, int],  # (F, H, W)
         freqs: torch.Tensor,  # [1024, head_dim//2]
         block_mask,  # BlockMask (unused with FlashInfer)
         kv_cache: Optional[PagedCache] = None,
         current_start: int = 0,
-        cache_start: Optional[int] = None,  # Unused, for API compatibility
         planner: Optional[FlashInferPlanner] = None,
     ) -> torch.Tensor:
         """
         Forward pass with FlashInfer attention.
 
+        Planning is handled automatically:
+        - First layer: Will call planner.plan() after updating cache
+        - Later layers: Will reuse plan from first layer
+
         Args:
             x: Input hidden states [B, seq_len, dim]
-            seq_lens: Sequence lengths [B]
-            grid_sizes: [F, H, W] grid dimensions
+            grid_sizes: (F, H, W) grid dimensions as tuple (not Tensor!)
             freqs: RoPE frequencies [1024, head_dim//2]
             block_mask: Attention mask (for full attention path only)
             kv_cache: PagedCache for incremental attention
             current_start: Current position in sequence
-            cache_start: Unused, for API compatibility with CausalWanSelfAttention
-            planner: FlashInferPlanner with pre-computed plan (required for incremental)
+            planner: FlashInferPlanner (will be planned in first layer if needed)
 
         Returns:
             Output hidden states [B, seq_len, dim]
         """
-        del seq_lens, cache_start  # Unused
         b, s, n, d = *x.shape[:2], self.num_heads, self.head_dim
 
         # Compute Q, K, V
@@ -427,16 +437,17 @@ class FlashInferCausalSelfAttention(nn.Module):
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
-        grid_sizes: torch.Tensor,
+        grid_sizes: Tuple[int, int, int],
         freqs: torch.Tensor,
         block_mask,
     ) -> torch.Tensor:
         """Full attention path (no KV cache)."""
         from wan.modules.model import rope_apply
 
-        # Apply standard RoPE
-        roped_q = rope_apply(q, grid_sizes, freqs).type_as(v)
-        roped_k = rope_apply(k, grid_sizes, freqs).type_as(v)
+        # Apply standard RoPE (rope_apply expects tensor, so convert tuple)
+        grid_tensor = torch.tensor(grid_sizes, device=q.device)
+        roped_q = rope_apply(q, grid_tensor, freqs).type_as(v)
+        roped_k = rope_apply(k, grid_tensor, freqs).type_as(v)
 
         # Padding for FlexAttention
         padded_length = math.ceil(q.shape[1] / 128) * 128 - q.shape[1]
@@ -471,7 +482,7 @@ class FlashInferCausalSelfAttention(nn.Module):
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
-        grid_sizes: torch.Tensor,
+        grid_sizes: Tuple[int, int, int],  # (F, H, W)
         freqs: torch.Tensor,
         kv_cache: PagedCache,
         current_start: int,
@@ -482,17 +493,16 @@ class FlashInferCausalSelfAttention(nn.Module):
 
         Uses pre-computed plan from FlashInferPlanner.
         """
-        assert grid_sizes.ndim == 1
         B = q.shape[0]
         assert B == 1, "PagedCache currently only supports batch size 1"
 
         # Initialize RoPE cache if needed
         self._init_rope_cache(freqs)
 
-        # Calculate frame position
-        frame_seqlen = math.prod(grid_sizes[1:]).item()
+        # Calculate frame position (grid_sizes is now a simple tuple!)
+        num_frames, height, width = grid_sizes
+        frame_seqlen = height * width
         current_start_frame = current_start // frame_seqlen
-        num_frames = grid_sizes[0].item()
 
         # Get precomputed frequencies for this frame range
         precomputed_freqs = self.rope_cache.get_freqs_for_frame_range(
@@ -500,8 +510,8 @@ class FlashInferCausalSelfAttention(nn.Module):
         )
 
         # Apply 3D RoPE using precomputed frequencies
-        roped_q = apply_rope_3d_precomputed(q, precomputed_freqs)
-        roped_k = apply_rope_3d_precomputed(k, precomputed_freqs)
+        roped_q = apply_rope_3d(q, precomputed_freqs)
+        roped_k = apply_rope_3d(k, precomputed_freqs)
 
         # Squeeze batch dimension for PagedCache (batch=1)
         roped_k_squeezed = roped_k.squeeze(0)  # [seq_len, num_heads, head_dim]
@@ -518,9 +528,11 @@ class FlashInferCausalSelfAttention(nn.Module):
 
         # Compute attention
         if planner is not None and planner.is_available:
-            # Plan if not already planned (first layer does this, subsequent layers skip)
+            # Plan if not already planned (first layer does this after cache update)
             # All layers have the same cache structure, so plan is reusable
             if not planner.is_planned:
+                # IMPORTANT: This is called AFTER cache.update_or_append() and cache.evict()
+                # so the cache state is up-to-date
                 planner.plan(
                     kv_cache=kv_cache,
                     q_len=roped_q.shape[1],
