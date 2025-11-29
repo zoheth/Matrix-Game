@@ -28,7 +28,7 @@ except ImportError:
     FLASHINFER_AVAILABLE = False
     BatchPrefillWithPagedKVCacheWrapper = None
 
-from wan.modules.attention import attention as flash_attention_fallback
+from wan.modules.attention import flash_attention as flash_attention_fallback
 
 from .paged_cache import PagedCache
 

@@ -227,76 +227,67 @@ class WanSelfAttention(nn.Module):
 
 class WanI2VCrossAttention(nn.Module):
     """
-    Cross-attention for image-to-video with internal KV caching.
+    Cross-attention for image-to-video from first principles.
 
-    Simple, clean implementation from first principles:
-    - Q from video latents (changes each forward)
-    - K/V from image context (fixed, cached after first forward)
-    - CUDA Graph compatible (no dynamic control flow after warmup)
+    Core idea:
+    - Q from video latents (recomputed each forward)
+    - K/V from image context (computed once, then cached)
+    - Standard cross-attention: softmax(Q @ K^T / sqrt(d)) @ V
     """
 
     def __init__(self, dim, num_heads, window_size, qk_norm=True, eps=1e-6):
         super().__init__()
         assert dim % num_heads == 0
-        self.dim = dim
+
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
 
-        # Projections
+        # Linear projections
         self.q = nn.Linear(dim, dim)
         self.k = nn.Linear(dim, dim)
         self.v = nn.Linear(dim, dim)
         self.o = nn.Linear(dim, dim)
 
-        # Optional Q/K normalization
-        self.norm_q = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
-        self.norm_k = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
+        # Q/K normalization
+        self.norm_q = nn.RMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
+        self.norm_k = nn.RMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
 
-        # Internal KV cache (allocated on first forward)
-        self.register_buffer('_k_cache', None, persistent=False)
-        self.register_buffer('_v_cache', None, persistent=False)
-        self.register_buffer('_is_cached', torch.zeros(1, dtype=torch.long), persistent=False)
+        # KV cache (simple Python attribute)
+        self._kv_cache = None
 
     def reset_cache(self):
-        """Reset cache for new generation sequence."""
-        self._is_cached.zero_()
+        """Clear cache for new sequence."""
+        self._kv_cache = None
 
     def forward(self, x, context):
         """
         Args:
-            x: Query input [B, L_q, C]
-            context: Key/Value context [B, L_kv, C]
+            x: [B, L_q, C] - Video latents
+            context: [B, L_kv, C] - Image context
 
         Returns:
-            Output [B, L_q, C]
+            [B, L_q, C]
         """
-        b, n, d = x.size(0), self.num_heads, self.head_dim
+        B = x.size(0)
+        H = self.num_heads
+        D = self.head_dim
 
         # Query (always computed)
-        q = self.norm_q(self.q(x)).view(b, -1, n, d)
+        q = self.norm_q(self.q(x)).view(B, -1, H, D)
 
-        # Lazy cache allocation
-        if self._k_cache is None:
-            L_kv = context.size(1)
-            self._k_cache = torch.zeros(b, L_kv, n, d, dtype=context.dtype, device=context.device)
-            self._v_cache = torch.zeros(b, L_kv, n, d, dtype=context.dtype, device=context.device)
-
-        # Compute K/V only on first forward
-        if self._is_cached.item() == 0:
-            k = self.norm_k(self.k(context)).view(b, -1, n, d)
-            v = self.v(context).view(b, -1, n, d)
-            self._k_cache.copy_(k)
-            self._v_cache.copy_(v)
-            self._is_cached.fill_(1)
-
-        # Use cached K/V
-        k, v = self._k_cache, self._v_cache
+        # Key/Value (cached after first forward)
+        if self._kv_cache is None:
+            k = self.norm_k(self.k(context)).view(B, -1, H, D)
+            v = self.v(context).view(B, -1, H, D)
+            self._kv_cache = (k, v)
+        else:
+            k, v = self._kv_cache
 
         # Attention
-        x = flash_attention(q, k, v, k_lens=None)
+        out = flash_attention(q, k, v)
 
-        # Output projection
-        return self.o(x.flatten(2))
+        # Output
+        return self.o(out.flatten(2))
 
 
 WAN_CROSSATTENTION_CLASSES = {

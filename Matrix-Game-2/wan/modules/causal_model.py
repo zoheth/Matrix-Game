@@ -1,4 +1,4 @@
-from wan.modules.attention import attention
+from wan.modules.attention import flash_attention
 from wan.modules.model import (
     WanRMSNorm,
     rope_apply,
