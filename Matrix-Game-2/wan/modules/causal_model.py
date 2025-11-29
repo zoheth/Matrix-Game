@@ -358,7 +358,6 @@ class CausalWanModel(ModelMixin, ConfigMixin, FromOriginalModelMixin, PeftAdapte
         'patch_size', 'cross_attn_norm', 'qk_norm', 'text_dim'
     ]
     _no_split_modules = ['WanAttentionBlock']
-    _supports_gradient_checkpointing = True
 
     @register_to_config
     def __init__(self,
@@ -474,16 +473,11 @@ class CausalWanModel(ModelMixin, ConfigMixin, FromOriginalModelMixin, PeftAdapte
         # initialize weights
         self.init_weights()
 
-        self.gradient_checkpointing = False
-
         self.block_mask = None
         self.block_mask_keyboard = None
         self.block_mask_mouse = None
         self.use_rope_keyboard = True
         self.num_frame_per_block = 1
-
-    def _set_gradient_checkpointing(self, module, value=False):
-        self.gradient_checkpointing = value
 
     def reset_crossattn_cache(self):
         """Reset cross-attention cache in all blocks."""
@@ -703,7 +697,7 @@ class CausalWanModel(ModelMixin, ConfigMixin, FromOriginalModelMixin, PeftAdapte
 
         return block_mask2
 
-    def _forward_inference(
+    def forward(
         self,
         x,
         t,
@@ -794,21 +788,6 @@ class CausalWanModel(ModelMixin, ConfigMixin, FromOriginalModelMixin, PeftAdapte
                     page_size=first_cache.page_size,
                 )
 
-        # arguments
-        kwargs = dict(
-            ada_params=e0,
-            grid_sizes=grid_sizes,
-            freqs=self.freqs,
-            context=context,
-            block_mask=self.block_mask,
-            action_context=action_context
-        )
-
-        def create_custom_forward(module):
-            def custom_forward(*inputs, **kwargs):
-                return module(*inputs, **kwargs)
-            return custom_forward
-
         with torch.profiler.record_function("CausalWanModel/transformer_blocks"):
             for block_index, block in enumerate(self.blocks):
                 with torch.profiler.record_function(f"CausalWanModel/block_{block_index}"):
@@ -817,24 +796,19 @@ class CausalWanModel(ModelMixin, ConfigMixin, FromOriginalModelMixin, PeftAdapte
                         action_context.kv_cache_mouse = kv_cache_mouse[block_index] if kv_cache_mouse else None
                         action_context.kv_cache_keyboard = kv_cache_keyboard[block_index] if kv_cache_keyboard else None
 
-                    if torch.is_grad_enabled() and self.gradient_checkpointing:
-                        kwargs.update({
-                            "kv_cache": kv_cache[block_index],
-                            "current_start": current_start,
-                            "planner": planner,
-                        })
-                        x = torch.utils.checkpoint.checkpoint(
-                            create_custom_forward(block),
-                            x, **kwargs,
-                            use_reentrant=False,
-                        )
-                    else:
-                        kwargs.update({
-                            "kv_cache": kv_cache[block_index],
-                            "current_start": current_start,
-                            "planner": planner,
-                        })
-                        x = block(x, **kwargs)
+                    # Inference path: direct block call
+                    x = block(
+                        x,
+                        ada_params=e0,
+                        grid_sizes=grid_sizes,
+                        freqs=self.freqs,
+                        context=context,
+                        block_mask=self.block_mask,
+                        action_context=action_context,
+                        kv_cache=kv_cache[block_index],
+                        current_start=current_start,
+                        planner=planner,
+                    )
 
         # head
         with torch.profiler.record_function("CausalWanModel/head"):
@@ -842,118 +816,7 @@ class CausalWanModel(ModelMixin, ConfigMixin, FromOriginalModelMixin, PeftAdapte
         # unpatchify
         with torch.profiler.record_function("CausalWanModel/unpatchify"):
             x = self.unpatchify(x, grid_sizes)
-        return x 
-
-    def _forward_train(
-        self,
-        x,
-        t,
-        visual_context,
-        cond_concat,
-        action_context: Optional[ActionContext] = None,
-    ):
-        r"""
-        Forward pass through the diffusion model
-
-        Args:
-            x (List[Tensor]):
-                List of input video tensors, each with shape [C_in, F, H, W]
-            t (Tensor):
-                Diffusion timesteps tensor of shape [B]
-            context (List[Tensor]):
-                List of text embeddings each with shape [L, C]
-            seq_len (`int`):
-                Maximum sequence length for positional encoding
-            clip_fea (Tensor, *optional*):
-                CLIP image features for image-to-video mode
-            y (List[Tensor], *optional*):
-                Conditional video inputs for image-to-video mode, same shape as x
-
-        Returns:
-            List[Tensor]:
-                List of denoised video tensors with original input shapes [C_out, F, H / 8, W / 8]
-        """
-        # params
-        if action_context is not None:
-            assert self.use_action_module == True
-        device = self.patch_embedding.weight.device
-        if self.freqs.device != device:
-            self.freqs = self.freqs.to(device)
-        # x = torch.cat([x, cond_concat], dim=1)
-
-        # Get or create block masks (allows Pipeline to provide pre-computed masks)
-        num_frames = x.shape[2]
-        frame_seqlen = x.shape[-2] * x.shape[-1] // (self.patch_size[1] * self.patch_size[2])
-
-        block_mask, block_mask_mouse, block_mask_keyboard = self._get_or_create_masks(
-            device=device,
-            num_frames=num_frames,
-            frame_seqlen=frame_seqlen,
-            # Pipeline can pass masks here in the future
-            block_mask=None,
-            block_mask_mouse=None,
-            block_mask_keyboard=None
-        )
-
-        x = self.patch_embedding(x)
-        # grid_sizes is now a simple tuple (F, H, W)
-        grid_sizes = tuple(x.shape[2:])
-        # Ensure contiguous output after transpose
-        x = x.flatten(2).transpose(1, 2).contiguous()
-        e = self.time_embedding(
-            sinusoidal_embedding_1d(self.freq_dim, t.flatten()).type_as(x))
-        e0 = self.time_projection(e).unflatten(
-            1, (6, self.dim)).unflatten(dim=0, sizes=t.shape)
-
-        context_lens = None
-        context = self.img_emb(visual_context)
-
-        # Set block masks in action_context if provided
-        if action_context is not None:
-            action_context.block_mask_mouse = block_mask_mouse
-            action_context.block_mask_keyboard = block_mask_keyboard
-
-        # arguments
-        kwargs = dict(
-            ada_params=e0,
-            grid_sizes=grid_sizes,
-            freqs=self.freqs,
-            context=context,
-            block_mask=block_mask,
-            action_context=action_context
-        )
-
-        def create_custom_forward(module):
-            def custom_forward(*inputs, **kwargs):
-                return module(*inputs, **kwargs)
-            return custom_forward
-
-        for block in self.blocks:
-            if torch.is_grad_enabled() and self.gradient_checkpointing:
-                x = torch.utils.checkpoint.checkpoint(
-                    create_custom_forward(block),
-                    x, **kwargs,
-                    use_reentrant=False,
-                )
-            else:
-                x = block(x, **kwargs)
-
-
-        # head
-        x = self.head(x, e.unflatten(dim=0, sizes=t.shape).unsqueeze(2))
-        # unpatchify
-        x = self.unpatchify(x, grid_sizes)
         return x
-
-    def forward(
-        self,
-        *args,
-        **kwargs
-    ):
-        if kwargs.get('kv_cache', None) is not None:
-            return self._forward_inference(*args, **kwargs)
-        else:
-            return self._forward_train(*args, **kwargs)
 
     def unpatchify(self, x, grid_sizes):
         r"""
