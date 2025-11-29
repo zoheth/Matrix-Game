@@ -98,6 +98,7 @@ class CausalWanAttentionBlock(nn.Module):
                  num_heads,
                  local_attn_size=-1,
                  sink_size=0,
+                 num_frame_per_block=1,
                  qk_norm=True,
                  cross_attn_norm=False,
                  action_config={},
@@ -123,8 +124,10 @@ class CausalWanAttentionBlock(nn.Module):
         self.norm2 = nn.LayerNorm(dim, eps, elementwise_affine=False)
         self.norm3 = nn.LayerNorm(dim, eps, elementwise_affine=True) if cross_attn_norm else nn.Identity()
 
-        # Attention layers - use CausalSelfAttention directly
-        self.self_attn = CausalSelfAttention(dim, num_heads, local_attn_size, sink_size, qk_norm, eps)
+        # Attention layers - use CausalSelfAttention with num_frame_per_block
+        self.self_attn = CausalSelfAttention(
+            dim, num_heads, local_attn_size, sink_size, num_frame_per_block, qk_norm, eps
+        )
         self.cross_attn = WAN_CROSSATTENTION_CLASSES[cross_attn_type](
             dim, num_heads, (-1, -1), qk_norm, eps
         )
@@ -377,6 +380,7 @@ class CausalWanModel(ModelMixin, ConfigMixin, FromOriginalModelMixin, PeftAdapte
                  num_layers=30,
                  local_attn_size=-1,
                  sink_size=0,
+                 num_frame_per_block=1,
                  qk_norm=True,
                  cross_attn_norm=True,
                  action_config={},
@@ -408,9 +412,11 @@ class CausalWanModel(ModelMixin, ConfigMixin, FromOriginalModelMixin, PeftAdapte
             num_layers (`int`, *optional*, defaults to 32):
                 Number of transformer blocks
             local_attn_size (`int`, *optional*, defaults to -1):
-                Window size for temporal local attention (-1 indicates global attention)
+                Window size for temporal local attention in frames (-1 indicates global attention)
             sink_size (`int`, *optional*, defaults to 0):
                 Size of the attention sink, we keep the first `sink_size` frames unchanged when rolling the KV cache
+            num_frame_per_block (`int`, *optional*, defaults to 1):
+                Number of frames per block for block-aligned causal attention mask
             qk_norm (`bool`, *optional*, defaults to True):
                 Enable query/key normalization
             cross_attn_norm (`bool`, *optional*, defaults to False):
@@ -435,6 +441,7 @@ class CausalWanModel(ModelMixin, ConfigMixin, FromOriginalModelMixin, PeftAdapte
         self.num_heads = num_heads
         self.num_layers = num_layers
         self.local_attn_size = local_attn_size
+        self.num_frame_per_block = num_frame_per_block
         self.qk_norm = qk_norm
         self.cross_attn_norm = cross_attn_norm
         self.eps = eps
@@ -452,8 +459,11 @@ class CausalWanModel(ModelMixin, ConfigMixin, FromOriginalModelMixin, PeftAdapte
         # blocks
         cross_attn_type = 'i2v_cross_attn'
         self.blocks = nn.ModuleList([
-            CausalWanAttentionBlock(cross_attn_type, dim, ffn_dim, num_heads,
-                                    local_attn_size, sink_size, qk_norm, cross_attn_norm, action_config=action_config, eps=eps, block_idx=idx)
+            CausalWanAttentionBlock(
+                cross_attn_type, dim, ffn_dim, num_heads,
+                local_attn_size, sink_size, self.num_frame_per_block,
+                qk_norm, cross_attn_norm, action_config=action_config, eps=eps, block_idx=idx
+            )
             for idx in range(num_layers)
         ])
 
@@ -480,7 +490,6 @@ class CausalWanModel(ModelMixin, ConfigMixin, FromOriginalModelMixin, PeftAdapte
         self.block_mask_keyboard = None
         self.block_mask_mouse = None
         self.use_rope_keyboard = True
-        self.num_frame_per_block = 1
 
     def reset_crossattn_cache(self):
         """Reset cross-attention cache in all blocks."""

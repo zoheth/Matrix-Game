@@ -63,8 +63,13 @@ class InteractiveGameInference:
 
     def _init_models(self):
         # Initialize diffusion model with FlashInfer attention (default)
-        generator = WanDiffusionWrapper(
-            **getattr(self.config, "model_kwargs", {}), is_causal=True)
+        model_kwargs = getattr(self.config, "model_kwargs", {}).copy()
+
+        # Add num_frame_per_block from inference config if present
+        if hasattr(self.config, 'inference') and hasattr(self.config.inference, 'num_frame_per_block'):
+            model_kwargs['num_frame_per_block'] = self.config.inference.num_frame_per_block
+
+        generator = WanDiffusionWrapper(**model_kwargs, is_causal=True)
 
         # Load checkpoint if provided
         if self.args.checkpoint_path:

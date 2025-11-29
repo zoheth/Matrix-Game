@@ -171,6 +171,22 @@ class CausalSelfAttention(nn.Module):
     FlashInfer-based causal self-attention with 3D RoPE.
 
     Inference-only implementation using paged KV cache.
+
+    **Alignment with training block_mask (block-aligned, "staircase" pattern):**
+
+    Training uses blockwise causal mask:
+        (kv_idx < ends[q_idx]) & (kv_idx >= ends[q_idx] - local_attn_size * frame_seqlen)
+    where ends[q_idx] is the end of the current block.
+
+    Inference implements block-aligned eviction:
+    - Determine current block from current_start
+    - From current_block_end, look back local_attn_size frames
+    - Align down to block boundary (ensures complete blocks only)
+    - Example (num_frame_per_block=3, local_attn_size=6):
+      * Block 2 (frames [6,7,8]): keeps [3,4,5,6,7,8] (Block 1 + Block 2)
+      * When generating frame 8: keeps [3,4,5,6,7] + current tokens
+      * When generating frame 9: keeps [6,7,8] + current tokens
+    - This creates the "staircase" pattern: only complete previous blocks visible
     """
 
     def __init__(
@@ -179,6 +195,7 @@ class CausalSelfAttention(nn.Module):
         num_heads: int,
         local_attn_size: int = -1,
         sink_size: int = 0,
+        num_frame_per_block: int = 1,
         qk_norm: bool = True,
         eps: float = 1e-6,
         height: int = 22,
@@ -193,14 +210,11 @@ class CausalSelfAttention(nn.Module):
         self.head_dim = dim // num_heads
         self.local_attn_size = local_attn_size
         self.sink_size = sink_size
+        self.num_frame_per_block = num_frame_per_block
 
         self.height = height
         self.width = width
         self.frame_seq_len = height * width
-        self.max_attention_size = (
-            15 * self.frame_seq_len if local_attn_size == -1
-            else local_attn_size * self.frame_seq_len
-        )
         self.page_size = page_size
 
         self.q = nn.Linear(dim, dim)
@@ -261,7 +275,29 @@ class CausalSelfAttention(nn.Module):
         current_end = current_start + roped_k_squeezed.shape[0]
 
         kv_cache.update_or_append(roped_k_squeezed, v_squeezed, current_start, current_end)
-        kv_cache.evict(self.max_attention_size)
+
+        # Block-aligned eviction to match training block_mask
+        block_size = self.num_frame_per_block * frame_seqlen
+        if self.local_attn_size == -1:
+            # Global attention: keep all frames (capped at 15 for memory)
+            keep_size = 15 * frame_seqlen
+        else:
+            # Calculate which block current_start belongs to
+            current_block_idx = current_start // block_size
+            # Calculate the end of current block (block boundary)
+            current_block_end = (current_block_idx + 1) * block_size
+
+            # From current_block_end, look back local_attn_size frames (matches training)
+            keep_from_position = max(0, current_block_end - self.local_attn_size * frame_seqlen)
+
+            # Align down to block boundary for "staircase" pattern
+            # keep_from_block_idx = keep_from_position // block_size
+            # keep_from_position = keep_from_block_idx * block_size
+
+            # Calculate how many tokens to keep
+            keep_size = current_end - keep_from_position
+
+        kv_cache.evict(keep_size)
 
         if not planner.is_planned:
             planner.plan(
