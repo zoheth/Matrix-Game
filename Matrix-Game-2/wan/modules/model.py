@@ -259,7 +259,7 @@ class WanI2VCrossAttention(nn.Module):
         """Clear cache for new sequence."""
         self._kv_cache = None
 
-    def forward(self, x, context):
+    def forward(self, x:torch.Tensor, context:torch.Tensor):
         """
         Args:
             x: [B, L_q, C] - Video latents
@@ -268,25 +268,27 @@ class WanI2VCrossAttention(nn.Module):
         Returns:
             [B, L_q, C]
         """
-        B = x.size(0)
         H = self.num_heads
-        D = self.head_dim
 
-        # Query (always computed)
-        q = self.norm_q(self.q(x)).view(B, -1, H, D)
+        q = self.norm_q(self.q(x))
+        q = rearrange(q, 'b l (h d) -> b l h d', h=H)
 
         # Key/Value (cached after first forward)
         if self._kv_cache is None:
-            k = self.norm_k(self.k(context)).view(B, -1, H, D)
-            v = self.v(context).view(B, -1, H, D)
+            k = self.norm_k(self.k(context))
+            v = self.v(context)
+            
+            k = rearrange(k, 'b l (h d) -> b l h d', h=H)
+            v = rearrange(v, 'b l (h d) -> b l h d', h=H)
+            
             self._kv_cache = (k, v)
         else:
             k, v = self._kv_cache
 
-        # Attention
         out = flash_attention(q, k, v)
 
-        # Output
+        out = rearrange(out, 'b l h d -> b l (h d)')
+
         return self.o(out.flatten(2))
 
 

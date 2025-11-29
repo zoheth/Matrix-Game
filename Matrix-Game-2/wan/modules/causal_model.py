@@ -186,75 +186,55 @@ class CausalWanAttentionBlock(nn.Module):
         combined_modulation = self.modulation.unsqueeze(1) + ada_params
 
         # Split into 6 components: [B, F, 1, C] each after chunking
-        shift_msa, scale_msa, gate_msa, shift_ffn, scale_ffn, gate_ffn = combined_modulation.chunk(6, dim=2)
+        (
+            shift_msa, scale_msa, gate_msa, 
+            shift_ffn, scale_ffn, gate_ffn
+        ) = rearrange(combined_modulation, 'b f six c -> six b f 1 c')
 
-        # ==================== Self-Attention Block ====================
-        x = self._apply_self_attention(
-            x, shift_msa, scale_msa, gate_msa,
-            num_frames, frame_seqlen,
-            grid_sizes, freqs, block_mask,
-            kv_cache, current_start, planner
+        x_mod = self._adaln_modulate(self.norm1(x), shift_msa, scale_msa, f=num_frames)
+        y = self.self_attn(
+            x_mod,
+            grid_sizes,
+            freqs,
+            kv_cache,
+            current_start,
+            planner,
         )
+        x = self._adaln_gated_residual(x, y, gate_msa, f=num_frames)
 
-        # ==================== Cross-Attention + Action + FFN Block ====================
-        x = self._apply_cross_attn_and_ffn(
-            x, context, shift_ffn, scale_ffn, gate_ffn,
-            num_frames, frame_seqlen, grid_sizes,
+        x = self._apply_condition_attn(
+            x, context, grid_sizes,
             current_start, action_context
         )
 
-        return x
-
-    def _apply_self_attention(
-        self,
-        x: torch.Tensor,
-        shift: torch.Tensor,
-        scale: torch.Tensor,
-        gate: torch.Tensor,
-        num_frames: int,
-        frame_seqlen: int,
-        grid_sizes: tuple,  # (F, H, W)
-        freqs: torch.Tensor,
-        block_mask,
-        kv_cache,
-        current_start: int,
-        planner: Optional[FlashInferPlanner] = None,
-    ) -> torch.Tensor:
-        """
-        Apply AdaLN-modulated self-attention with gated residual.
-
-        Formula: x + gate * self_attn(norm(x) * (1 + scale) + shift)
-        """
-        with torch.profiler.record_function("CausalWanAttentionBlock/self_attn"):
-            # AdaLN: norm(x) * (1 + scale) + shift
-            x_norm = self.norm1(x)
-            x_modulated = (
-                x_norm.unflatten(dim=1, sizes=(num_frames, frame_seqlen)) * (1 + scale) + shift
-            ).flatten(1, 2)
-
-            y = self.self_attn(
-                x_modulated,
-                grid_sizes,
-                freqs,
-                kv_cache,
-                current_start,
-                planner,
-            )
-
-            # Gated residual
-            x = x + (y.unflatten(dim=1, sizes=(num_frames, frame_seqlen)) * gate).flatten(1, 2)
+        x_mod = self._adaln_modulate(self.norm2(x), shift_ffn, scale_ffn, f=num_frames)
+        y = self.ffn(x_mod)
+        x = self._adaln_gated_residual(x, y, gate_ffn, f=num_frames)
 
         return x
+    
+    def _adaln_modulate(self, x_normed: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor, f: int) -> torch.Tensor:
+        """
+        Input:  x_normed [B, T, C], shift/scale [B, F, 1, C]
+        Output: [B, T, C] (Modulated)
+        """
+        x_view = rearrange(x_normed, 'b (f l) c -> b f l c', f=f)
+        x_mod = x_view * (1 + scale) + shift
+        return rearrange(x_mod, 'b f l c -> b (f l) c')
 
-    def _apply_cross_attn_and_ffn(
+    def _adaln_gated_residual(self, x: torch.Tensor, y: torch.Tensor, gate: torch.Tensor, f: int) -> torch.Tensor:
+        """
+        Input:  x [B, T, C] (Residual), y [B, T, C] (Branch), gate [B, F, 1, C]
+        Output: [B, T, C] (x + gate * y)
+        """
+        y_view = rearrange(y, 'b (f l) c -> b f l c', f=f)
+        y_gated = rearrange(y_view * gate, 'b f l c -> b (f l) c')
+        return x + y_gated
+
+    def _apply_condition_attn(
         self,
         x: torch.Tensor,
         context: torch.Tensor,
-        shift: torch.Tensor,
-        scale: torch.Tensor,
-        gate: torch.Tensor,
-        num_frames: int,
-        frame_seqlen: int,
         grid_sizes: tuple,  # (F, H, W)
         current_start: int,
         action_context: Optional[ActionContext]
@@ -308,20 +288,6 @@ class CausalWanAttentionBlock(nn.Module):
                     num_frame_per_block=action_context.num_frame_per_block
                 )
 
-        # Feed-forward network with AdaLN
-        with torch.profiler.record_function("CausalWanAttentionBlock/ffn"):
-            # AdaLN: norm(x) * (1 + scale) + shift
-            x_norm = self.norm2(x)
-            x_modulated = (
-                x_norm.unflatten(dim=1, sizes=(num_frames, frame_seqlen)) * (1 + scale) + shift
-            ).flatten(1, 2)
-
-            # FFN
-            y = self.ffn(x_modulated)
-
-            # Gated residual
-            x = x + (y.unflatten(dim=1, sizes=(num_frames, frame_seqlen)) * gate).flatten(1, 2)
-
         return x
 
 
@@ -336,7 +302,7 @@ class CausalHead(nn.Module):
 
         # layers
         out_dim = math.prod(patch_size) * out_dim
-        self.norm = WanLayerNorm(dim, eps)
+        self.norm = nn.LayerNorm(dim, elementwise_affine=False, eps=eps)
         self.head = nn.Linear(dim, out_dim)
 
         # modulation
@@ -345,15 +311,34 @@ class CausalHead(nn.Module):
     def forward(self, x, e):
         r"""
         Args:
-            x(Tensor): Shape [B, L1, C]
-            e(Tensor): Shape [B, F, 1, C]
+            x(Tensor): Shape [B, L1, C] - Input features (L1 = F * S)
+            e(Tensor): Shape [B, F, 1, C] - Conditioning / AdaLN parameters
         """
-        
-        num_frames, frame_seqlen = e.shape[1], x.shape[1] // e.shape[1]
-        e = (self.modulation.unsqueeze(1) + e).chunk(2, dim=2)
-        x = (self.head(self.norm(x).unflatten(dim=1, sizes=(num_frames, frame_seqlen)) * (1 + e[1]) + e[0]))
-        return x
+        combined_style = e + self.modulation.unsqueeze(1)
 
+        shift, scale = rearrange(combined_style, 'b f two c -> two b f 1 c', two=2)
+
+        x = self.norm(x)
+
+        x = rearrange(x, 'b (f s) c -> b f s c', f=e.shape[1])
+
+        x = x * (1 + scale) + shift
+
+        return self.head(x)
+
+
+def get_rope_freqs_complex(max_seq_len: int, dim: int, theta: float = 10000.0):
+    """生成的形状为 [L, D/2] 的复数频率"""
+    assert dim % 2 == 0
+    # 使用 float64 保证精度
+    indices = torch.arange(0, dim, 2, dtype=torch.float64)
+    # 计算 theta_i
+    freqs = 1.0 / (theta ** (indices / dim))
+    # 计算 m * theta_i
+    t = torch.arange(max_seq_len, dtype=torch.float64)
+    freqs = torch.outer(t, freqs)  # [L, D/2]
+    # 转为复数 e^{im\theta}
+    return torch.polar(torch.ones_like(freqs), freqs).to(torch.float32)
 
 class CausalWanModel(ModelMixin, ConfigMixin, FromOriginalModelMixin, PeftAdapterMixin):
     r"""
@@ -472,11 +457,17 @@ class CausalWanModel(ModelMixin, ConfigMixin, FromOriginalModelMixin, PeftAdapte
 
         # buffers (don't use register_buffer otherwise dtype will be changed in to())
         assert (dim % num_heads) == 0 and (dim // num_heads) % 2 == 0
-        d = dim // num_heads
+        head_dim = dim // num_heads
+
+        split_size = head_dim // 6
+        dim_h = split_size * 2
+        dim_w = split_size * 2
+        dim_t = head_dim - dim_h - dim_w
+        max_pos = 1024
         self.freqs = torch.cat([
-            rope_params(1024, d - 4 * (d // 6)),
-            rope_params(1024, 2 * (d // 6)),
-            rope_params(1024, 2 * (d // 6))
+            rope_params(max_pos, dim_t),
+            rope_params(max_pos, dim_h),
+            rope_params(max_pos, dim_w)
         ],
             dim=1)
 
