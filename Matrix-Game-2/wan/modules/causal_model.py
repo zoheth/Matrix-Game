@@ -115,7 +115,10 @@ class CausalWanAttentionBlock(nn.Module):
 
         # Action module (conditional instantiation)
         if len(action_config) != 0 and block_idx in action_config['blocks']:
-            self.action_model = ActionModule(**action_config, local_attn_size=self.local_attn_size)
+            from wan.modules.modular_action.action_config import ActionConfig
+            # Create ActionConfig from dict and override local_attn_size
+            config_dict = {**action_config, 'local_attn_size': local_attn_size}
+            self.action_model = ActionModule(ActionConfig.from_dict(config_dict))
         else:
             self.action_model = None
 
@@ -264,28 +267,19 @@ class CausalWanAttentionBlock(nn.Module):
 
             with torch.profiler.record_function("CausalWanAttentionBlock/action_module"):
                 # Compute start_frame from current_start
-                # grid_sizes[1:] gives spatial dimensions [H, W]
                 spatial_tokens_per_frame = int(grid_sizes[1] * grid_sizes[2])
                 start_frame = current_start // spatial_tokens_per_frame
 
-                # Update action_context with computed start_frame
-                action_context.start_frame = start_frame
-
                 x = self.action_model(
                     x.to(context.dtype),
-                    grid_sizes[0],  # num_frames
-                    grid_sizes[1],  # height
-                    grid_sizes[2],  # width
-                    action_context.mouse_cond,
-                    action_context.keyboard_cond,
-                    action_context.block_mask_mouse,
-                    action_context.block_mask_keyboard,
+                    grid_sizes,
+                    mouse_condition=action_context.mouse_cond,
+                    keyboard_condition=action_context.keyboard_cond,
                     is_causal=True,
                     kv_cache_mouse=action_context.kv_cache_mouse,
                     kv_cache_keyboard=action_context.kv_cache_keyboard,
-                    start_frame=action_context.start_frame,
-                    use_rope_keyboard=action_context.use_rope_keyboard,
-                    num_frame_per_block=action_context.num_frame_per_block
+                    start_frame=start_frame,
+                    num_frame_per_block=action_context.num_frame_per_block,
                 )
 
         return x
@@ -767,11 +761,8 @@ class CausalWanModel(ModelMixin, ConfigMixin, FromOriginalModelMixin, PeftAdapte
             context_lens = None
             context = self.img_emb(visual_context)
 
-        # Set block masks in action_context if provided
+        # Ensure ActionContext has correct num_frame_per_block from model config
         if action_context is not None:
-            action_context.block_mask_mouse = self.block_mask_mouse
-            action_context.block_mask_keyboard = self.block_mask_keyboard
-            action_context.use_rope_keyboard = self.use_rope_keyboard
             action_context.num_frame_per_block = self.num_frame_per_block
 
         # Check if using PagedCache and setup FlashInfer planner if so
@@ -862,14 +853,16 @@ class CausalWanModel(ModelMixin, ConfigMixin, FromOriginalModelMixin, PeftAdapte
 
         # init output layer
         nn.init.zeros_(self.head.head.weight)
-        if self.use_action_module == True:
-            for m in self.blocks:
-                try:
-                    nn.init.zeros_(m.action_model.proj_mouse.weight)
-                    if m.action_model.proj_mouse.bias is not None:
-                        nn.init.zeros_(m.action_model.proj_mouse.bias)
-                    nn.init.zeros_(m.action_model.proj_keyboard.weight)
-                    if m.action_model.proj_keyboard.bias is not None:
-                        nn.init.zeros_(m.action_model.proj_keyboard.bias)
-                except:
-                    pass
+        if self.use_action_module:
+            for block in self.blocks:
+                if block.action_model is not None:
+                    # Initialize mouse injector output projection
+                    if block.action_model.mouse_injector is not None:
+                        nn.init.zeros_(block.action_model.mouse_injector.proj_mouse.weight)
+                        if block.action_model.mouse_injector.proj_mouse.bias is not None:
+                            nn.init.zeros_(block.action_model.mouse_injector.proj_mouse.bias)
+                    # Initialize keyboard injector output projection
+                    if block.action_model.keyboard_injector is not None:
+                        nn.init.zeros_(block.action_model.keyboard_injector.proj_keyboard.weight)
+                        if block.action_model.keyboard_injector.proj_keyboard.bias is not None:
+                            nn.init.zeros_(block.action_model.keyboard_injector.proj_keyboard.bias)

@@ -217,14 +217,12 @@ class MouseInjector(IAttentionInjector):
         self,
         x: torch.Tensor,
         condition: Optional[torch.Tensor],
-        freqs_cis: Tuple[torch.Tensor, torch.Tensor],
         spatial_shape: Tuple[int, int],
         temporal_shape: int,
         is_causal: bool = False,
         kv_cache: Optional["RingBufferActionCache"] = None,
         start_frame: int = 0,
         num_frame_per_block: int = 1,
-        block_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Forward pass for mouse condition injection.
@@ -232,14 +230,12 @@ class MouseInjector(IAttentionInjector):
         Args:
             x: [B, T*S, C_img] - Input hidden states
             condition: [B, N_frames, C_mouse] - Mouse condition
-            freqs_cis: (cos, sin) RoPE frequencies
             spatial_shape: (H, W) spatial dimensions
             temporal_shape: T temporal dimension
             is_causal: Whether to use causal attention
             kv_cache: KV cache for incremental decoding
             start_frame: Starting frame index for RoPE
             num_frame_per_block: Number of frames per block
-            block_mask: Optional block mask
 
         Returns:
             Output hidden states [B, T*S, C_img]
@@ -382,14 +378,12 @@ class KeyboardInjector(IAttentionInjector):
         self,
         x: torch.Tensor,
         condition: Optional[torch.Tensor],
-        freqs_cis: Tuple[torch.Tensor, torch.Tensor],
         spatial_shape: Tuple[int, int],
         temporal_shape: int,
         is_causal: bool = False,
         kv_cache: Optional["RingBufferActionCache"] = None,
         start_frame: int = 0,
         num_frame_per_block: int = 1,
-        block_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Forward pass for keyboard condition injection.
@@ -397,14 +391,12 @@ class KeyboardInjector(IAttentionInjector):
         Args:
             x: [B, T*S, C_img] - Input hidden states
             condition: [B, N_frames, C_keyboard] - Keyboard condition
-            freqs_cis: (cos, sin) RoPE frequencies
             spatial_shape: (H, W) spatial dimensions
             temporal_shape: T temporal dimension
             is_causal: Whether to use causal attention
             kv_cache: RingBufferActionCache for incremental decoding
             start_frame: Starting frame index for RoPE
             num_frame_per_block: Number of frames per block
-            block_mask: Optional block mask
 
         Returns:
             Output hidden states [B, T*S, C_img]

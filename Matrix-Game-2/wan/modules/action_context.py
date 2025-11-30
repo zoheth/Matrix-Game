@@ -24,86 +24,41 @@ from torch.nn.attention.flex_attention import BlockMask, create_block_mask
 @dataclass
 class ActionContext:
     """
-    Encapsulates all action-related state for inference.
+    Encapsulates action-related state for inference.
 
-    This is the ONLY place in the model stack where "mouse" and "keyboard"
-    terminology appears (configuration classes excepted).
+    Clean, minimal design with only essential fields.
 
     Attributes:
-        mouse_cond: Mouse movement conditions [B, N_frames, 2]
-        keyboard_cond: Keyboard press conditions [B, N_frames, 6]
-        block_mask_mouse: Attention mask for mouse conditioning
-        block_mask_keyboard: Attention mask for keyboard conditioning
-        kv_cache_mouse: Per-block KV caches for mouse attention
-        kv_cache_keyboard: Per-block KV caches for keyboard attention
-        use_rope_keyboard: Whether to apply RoPE to keyboard embeddings
+        mouse_cond: Mouse movement conditions [B, N_frames, C_mouse]
+        keyboard_cond: Keyboard press conditions [B, N_frames, C_keyboard]
+        kv_cache_mouse: Per-block KV cache for mouse attention
+        kv_cache_keyboard: Per-block KV cache for keyboard attention
         num_frame_per_block: Number of frames per attention block
-        start_frame: Starting frame index for current inference step
 
     Usage:
-        # Created by Pipeline
         action_ctx = ActionContext(
             mouse_cond=mouse_data,
             keyboard_cond=keyboard_data,
-            block_mask_mouse=mask_factory.create_mouse_mask(...),
-            ...
+            num_frame_per_block=3,
         )
-
-        # Passed through model hierarchy
         model.forward(..., action_context=action_ctx)
-            └─> block.forward(..., action_context=action_ctx)
-                └─> action_module.forward(..., action_context)
     """
 
-    # Input conditions (from dataset/user input)
+    # Input conditions
     mouse_cond: Optional[torch.Tensor] = None
     keyboard_cond: Optional[torch.Tensor] = None
 
-    # Attention masks (pre-computed by pipeline via BlockMaskFactory)
-    block_mask_mouse: Optional[BlockMask] = None
-    block_mask_keyboard: Optional[BlockMask] = None
+    # KV caches (managed by pipeline)
+    kv_cache_mouse: Optional[Dict[str, torch.Tensor]] = None
+    kv_cache_keyboard: Optional[Dict[str, torch.Tensor]] = None
 
-    # KV caches (managed by CacheManager in pipeline)
-    kv_cache_mouse: Optional[Dict[str, torch.Tensor]] = None  # Single block's cache
-    kv_cache_keyboard: Optional[Dict[str, torch.Tensor]] = None  # Single block's cache
-
-    # Configuration flags
-    use_rope_keyboard: bool = True
+    # Runtime configuration
     num_frame_per_block: int = 1
-    start_frame: int = 0
 
     @property
     def has_any_condition(self) -> bool:
         """Check if any action conditioning is provided."""
         return self.mouse_cond is not None or self.keyboard_cond is not None
-
-    @property
-    def has_mouse(self) -> bool:
-        """Check if mouse conditioning is provided."""
-        return self.mouse_cond is not None
-
-    @property
-    def has_keyboard(self) -> bool:
-        """Check if keyboard conditioning is provided."""
-        return self.keyboard_cond is not None
-
-    def to_legacy_kwargs(self) -> Dict[str, any]:
-        """
-        Convert to legacy kwargs format for backward compatibility.
-
-        Returns:
-            Dictionary with legacy parameter names
-        """
-        return {
-            'mouse_cond': self.mouse_cond,
-            'keyboard_cond': self.keyboard_cond,
-            'block_mask_mouse': self.block_mask_mouse,
-            'block_mask_keyboard': self.block_mask_keyboard,
-            'kv_cache_mouse': self.kv_cache_mouse,
-            'kv_cache_keyboard': self.kv_cache_keyboard,
-            'use_rope_keyboard': self.use_rope_keyboard,
-            'num_frame_per_block': self.num_frame_per_block,
-        }
 
 
 class BlockMaskFactory:
@@ -286,39 +241,3 @@ class BlockMaskFactory:
         return block_mask
 
 
-def create_action_context_from_kwargs(**kwargs) -> Optional[ActionContext]:
-    """
-    Factory function to create ActionContext from scattered kwargs.
-
-    This is a migration helper for gradual conversion from old API.
-
-    Args:
-        **kwargs: Scattered action parameters
-
-    Returns:
-        ActionContext if any action conditioning exists, None otherwise
-
-    Example:
-        # Old code
-        model.forward(x, ada_params, ..., mouse_cond=mc, keyboard_cond=kc, ...)
-
-        # Migration step
-        action_ctx = create_action_context_from_kwargs(
-            mouse_cond=mc, keyboard_cond=kc, ...
-        )
-        model.forward(x, ada_params, ..., action_context=action_ctx)
-    """
-    if kwargs.get('mouse_cond') is None and kwargs.get('keyboard_cond') is None:
-        return None
-
-    return ActionContext(
-        mouse_cond=kwargs.get('mouse_cond'),
-        keyboard_cond=kwargs.get('keyboard_cond'),
-        block_mask_mouse=kwargs.get('block_mask_mouse'),
-        block_mask_keyboard=kwargs.get('block_mask_keyboard'),
-        kv_cache_mouse=kwargs.get('kv_cache_mouse'),
-        kv_cache_keyboard=kwargs.get('kv_cache_keyboard'),
-        use_rope_keyboard=kwargs.get('use_rope_keyboard', True),
-        num_frame_per_block=kwargs.get('num_frame_per_block', 1),
-        start_frame=kwargs.get('start_frame', 0)
-    )

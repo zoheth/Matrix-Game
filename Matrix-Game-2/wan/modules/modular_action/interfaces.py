@@ -26,20 +26,18 @@ class IActionPreprocessor(nn.Module, ABC):
         pass
     
 class IAttentionInjector(nn.Module, ABC):
-    """"""
+    """Base interface for attention-based condition injectors."""
     @abstractmethod
     def forward(
         self,
         x: torch.Tensor,
         condition: Optional[torch.Tensor],
-        freqs_cis: Tuple[torch.Tensor, torch.Tensor],
         spatial_shape: Tuple[int, int],
         temporal_shape: int,
         is_causal: bool = False,
-        kv_cache=None,  # ActionCache instance or None
+        kv_cache=None,
         start_frame: int = 0,
         num_frame_per_block: int = 1,
-        block_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         pass
     
