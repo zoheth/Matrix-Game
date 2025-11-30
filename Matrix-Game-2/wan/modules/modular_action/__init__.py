@@ -18,10 +18,9 @@ from wan.modules.modular_action.injectors import (
 )
 
 from wan.modules.modular_action.interfaces import (
-    IAttentionInjector,
-    IActionPreprocessor,
+    ActionInjector,
     KVCacheManager,
-    FlashInferAttentionCore,
+    AttentionKernel,
     WanRMSNorm,
 )
 
@@ -40,10 +39,9 @@ __all__ = [
     "MouseInjector",
     "KeyboardInjector",
 
-    # Interfaces
-    "IAttentionInjector",
-    "IActionPreprocessor",
+    # Core components
+    "ActionInjector",
     "KVCacheManager",
-    "FlashInferAttentionCore",
+    "AttentionKernel",
     "WanRMSNorm",
 ]

@@ -5,9 +5,8 @@ from torch import nn
 from einops import rearrange
 
 from wan.modules.modular_action.interfaces import (
-    IAttentionInjector,
-    IActionPreprocessor,
-    FlashInferAttentionCore,
+    ActionInjector,
+    AttentionKernel,
     WanRMSNorm,
 )
 from wan.modules.modular_action.action_config import ActionConfig
@@ -19,14 +18,17 @@ if TYPE_CHECKING:
 
 # Note: Triton KV cache kernel disabled - PagedCache uses standard path
 
-class MousePreprocessor(IActionPreprocessor):
+class MousePreprocessor(nn.Module):
     """
     Preprocessor for mouse condition data.
     Fuses mouse condition with hidden states using sliding window.
     """
 
     def __init__(self, vae_time_compression_ratio: int, windows_size: int):
-        super().__init__(vae_time_compression_ratio, windows_size)
+        super().__init__()
+        self.vae_time_compression_ratio = vae_time_compression_ratio
+        self.windows_size = windows_size
+        self.pat_t = vae_time_compression_ratio * windows_size
 
     def forward(
         self,
@@ -90,12 +92,15 @@ class MousePreprocessor(IActionPreprocessor):
         return fused
 
 
-class KeyboardPreprocessor(IActionPreprocessor):
+class KeyboardPreprocessor(nn.Module):
     """Preprocessor for keyboard condition data."""
 
     def __init__(self, vae_time_compression_ratio: int, windows_size: int,
                  keyboard_dim_in: int, hidden_size: int):
-        super().__init__(vae_time_compression_ratio, windows_size)
+        super().__init__()
+        self.vae_time_compression_ratio = vae_time_compression_ratio
+        self.windows_size = windows_size
+        self.pat_t = vae_time_compression_ratio * windows_size
         # Keyboard embedding layers - 将 keyboard 输入映射到 hidden_size
         self.keyboard_embed = nn.Sequential(
             nn.Linear(keyboard_dim_in, hidden_size, bias=True),
@@ -157,7 +162,7 @@ class KeyboardPreprocessor(IActionPreprocessor):
         return group_keyboard
 
 
-class MouseInjector(IAttentionInjector):
+class MouseInjector(ActionInjector):
     """
     Mouse condition injector using self-attention with RoPE.
     Based on the original ActionModule mouse attention implementation.
@@ -208,7 +213,7 @@ class MouseInjector(IAttentionInjector):
         )
 
         # Attention core
-        self.attn_core = FlashInferAttentionCore()
+        self.attn_core = AttentionKernel()
 
         # Cache configuration
         self.max_attention_size = action_config.local_attn_size
@@ -320,7 +325,7 @@ class MouseInjector(IAttentionInjector):
         return output
 
 
-class KeyboardInjector(IAttentionInjector):
+class KeyboardInjector(ActionInjector):
     """
     Keyboard condition injector using cross-attention with RoPE.
     Based on the original ActionModule keyboard attention implementation.
@@ -369,7 +374,7 @@ class KeyboardInjector(IAttentionInjector):
         )
 
         # Attention core
-        self.attn_core = FlashInferAttentionCore()
+        self.attn_core = AttentionKernel()
 
         # Cache configuration
         self.max_attention_size = action_config.local_attn_size

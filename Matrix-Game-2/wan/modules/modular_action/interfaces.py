@@ -13,20 +13,8 @@ if TYPE_CHECKING:
 
 import flashinfer
 
-class IActionPreprocessor(nn.Module, ABC):
-    """ (B, N_frames, C) -> (B, T_q_or_k, C_windowed)"""
-    def __init__(self, vae_time_compression_ratio: int, windows_size: int):
-        super().__init__()
-        self.vae_time_compression_ratio = vae_time_compression_ratio
-        self.windows_size = windows_size
-        self.pat_t = vae_time_compression_ratio * windows_size
-        
-    @abstractmethod
-    def forward(self, condition: torch.Tensor, N_feats: int, is_causal: bool, num_frame_per_block: int) -> torch.Tensor:
-        pass
-    
-class IAttentionInjector(nn.Module, ABC):
-    """Base interface for attention-based condition injectors."""
+class ActionInjector(nn.Module, ABC):
+    """Base class for action condition injectors."""
     @abstractmethod
     def forward(
         self,
@@ -80,34 +68,6 @@ class KVCacheManager(nn.Module):
         )
 
 
-class IAttentionCore(nn.Module, ABC):
-    """Abstract base class for attention computation"""
-
-    @abstractmethod
-    def forward(
-        self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        causal: bool = False,
-        use_rope: bool = False,
-    ) -> torch.Tensor:
-        """
-        Compute attention output.
-
-        Args:
-            q: Query tensor [BS, seq_len_q, num_heads, head_dim]
-            k: Key tensor [BS, seq_len_k, num_heads, head_dim]
-            v: Value tensor [BS, seq_len_k, num_heads, head_dim]
-            causal: Whether to apply causal masking
-            use_rope: Whether to apply RoPE on-the-fly
-
-        Returns:
-            Attention output [BS, seq_len_q, num_heads, head_dim]
-        """
-        pass
-
-
 class WanRMSNorm(nn.Module):
     """Root Mean Square Layer Normalization"""
 
@@ -126,7 +86,7 @@ class WanRMSNorm(nn.Module):
         return x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps) * self.weight
 
 
-class FlashInferAttentionCore(IAttentionCore):
+class AttentionKernel(nn.Module):
     """
     FlashInfer-based attention implementation with integrated RoPE support.
 

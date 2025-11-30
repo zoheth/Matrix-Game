@@ -4,7 +4,7 @@ This tests that the integrated RoPE produces correct results.
 """
 
 import torch
-from wan.modules.modular_action.interfaces import FlashInferAttentionCore
+from wan.modules.modular_action.interfaces import AttentionKernel
 
 def test_flashinfer_rope_integration():
     """Test that FlashInfer's integrated RoPE works correctly."""
@@ -28,7 +28,7 @@ def test_flashinfer_rope_integration():
 
     # Test 1: Basic attention without RoPE
     print("\n[Test 1] Basic attention without RoPE...")
-    attn_core = FlashInferAttentionCore()
+    attn_core = AttentionKernel()
     try:
         output1 = attn_core(q, k, v, causal=False, use_rope=False)
         print(f"✓ Output shape: {output1.shape}")
