@@ -856,13 +856,4 @@ class CausalWanModel(ModelMixin, ConfigMixin, FromOriginalModelMixin, PeftAdapte
         if self.use_action_module:
             for block in self.blocks:
                 if block.action_model is not None:
-                    # Initialize mouse injector output projection
-                    if block.action_model.mouse_injector is not None:
-                        nn.init.zeros_(block.action_model.mouse_injector.proj_mouse.weight)
-                        if block.action_model.mouse_injector.proj_mouse.bias is not None:
-                            nn.init.zeros_(block.action_model.mouse_injector.proj_mouse.bias)
-                    # Initialize keyboard injector output projection
-                    if block.action_model.keyboard_injector is not None:
-                        nn.init.zeros_(block.action_model.keyboard_injector.proj_keyboard.weight)
-                        if block.action_model.keyboard_injector.proj_keyboard.bias is not None:
-                            nn.init.zeros_(block.action_model.keyboard_injector.proj_keyboard.bias)
+                    block.action_model.init_weights()

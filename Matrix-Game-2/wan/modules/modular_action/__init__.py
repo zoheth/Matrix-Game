@@ -1,5 +1,9 @@
 """
 Modular Action Module Package
+
+Terminology:
+    - View Control: Camera/view angle control (input: mouse, gamepad right stick)
+    - Movement: Character movement (input: keyboard WASD, gamepad left stick)
 """
 
 from wan.modules.modular_action.action_config import (
@@ -12,9 +16,13 @@ from wan.modules.modular_action.action_config import (
 
 from wan.modules.modular_action.action_module import ActionModule
 
-from wan.modules.modular_action.injectors import (
-    MouseInjector,
-    KeyboardInjector,
+from wan.modules.modular_action.view_control import (
+    ViewControlInjector,
+    ViewControlPreprocessor,
+)
+from wan.modules.modular_action.movement_control import (
+    MovementInjector,
+    MovementPreprocessor,
 )
 
 from wan.modules.modular_action.interfaces import (
@@ -36,8 +44,10 @@ __all__ = [
     "get_action_config",
 
     # Injectors
-    "MouseInjector",
-    "KeyboardInjector",
+    "ViewControlInjector",
+    "MovementInjector",
+    "ViewControlPreprocessor",
+    "MovementPreprocessor",
 
     # Core components
     "ActionInjector",
