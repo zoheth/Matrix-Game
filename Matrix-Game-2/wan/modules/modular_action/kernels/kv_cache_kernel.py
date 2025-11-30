@@ -23,8 +23,7 @@ def update_kv_cache_optimized(
     """
     Update ActionCache with new KV pairs and return attention window.
 
-    This is a thin wrapper around ActionCache.update_and_get_window() for
-    compatibility with the KVCacheManager interface.
+    This is a thin wrapper around ActionCache.update_and_get_window().
 
     Args:
         kv_cache: ActionCache instance

@@ -28,44 +28,6 @@ class ActionInjector(nn.Module, ABC):
         num_frame_per_block: int = 1,
     ) -> torch.Tensor:
         pass
-    
-class KVCacheManager(nn.Module):
-    """Manages KV cache with sliding window using ActionCache (legacy)"""
-    def __init__(self, local_attn_size: int, sink_size: int = 0):
-        super().__init__()
-        self.max_attention_size = local_attn_size
-        self.sink_tokens = sink_size
-
-    def update_cache(
-        self,
-        kv_cache,  # ActionCache instance
-        k: torch.Tensor,
-        v: torch.Tensor,
-        num_new_tokens: int
-    ) -> Tuple[torch.Tensor, torch.Tensor, int, int]:
-        """
-        Update ActionCache with new key-value pairs using sliding window strategy.
-
-        Args:
-            kv_cache: ActionCache instance
-            k: New keys [BS, num_new_tokens, num_heads, head_dim]
-            v: New values [BS, num_new_tokens, num_heads, head_dim]
-            num_new_tokens: Number of new tokens to add
-
-        Returns:
-            k_window: Keys in attention window [BS, window_len, num_heads, head_dim]
-            v_window: Values in attention window [BS, window_len, num_heads, head_dim]
-            local_start_index: Start index in cache
-            local_end_index: End index in cache
-        """
-        return update_kv_cache_optimized(
-            kv_cache=kv_cache,
-            k=k,
-            v=v,
-            num_new_tokens=num_new_tokens,
-            max_attention_size=self.max_attention_size,
-            sink_tokens=self.sink_tokens,
-        )
 
 
 class WanRMSNorm(nn.Module):

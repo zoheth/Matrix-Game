@@ -27,7 +27,6 @@ from wan.modules.modular_action.movement_control import (
 
 from wan.modules.modular_action.interfaces import (
     ActionInjector,
-    KVCacheManager,
     AttentionKernel,
     WanRMSNorm,
 )
@@ -51,7 +50,6 @@ __all__ = [
 
     # Core components
     "ActionInjector",
-    "KVCacheManager",
     "AttentionKernel",
     "WanRMSNorm",
 ]

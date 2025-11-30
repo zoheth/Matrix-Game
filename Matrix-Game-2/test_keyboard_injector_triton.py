@@ -11,7 +11,6 @@ import copy
 # Import the components we need to test
 from wan.modules.modular_action.injectors import KeyboardInjector
 from wan.modules.modular_action.action_config import ActionConfig
-from wan.modules.modular_action.interfaces import KVCacheManager
 from wan.modules.modular_action.kernels.before_attn_kernel import update_kv_cache_triton
 from wan.modules.modular_action.kernels.kv_cache_kernel import update_kv_cache_optimized
 
