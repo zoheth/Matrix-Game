@@ -8,7 +8,7 @@ from torchvision.transforms import v2
 from diffusers.utils import load_image
 from einops import rearrange
 from pipeline import BatchCausalInferencePipeline, PipelineConfig
-from wan.vae.wanx_vae import get_wanx_vae_wrapper
+from wan.vae.wanx_vae import create_wan_encoder
 from demo_utils.vae_block3 import VAEDecoderWrapper as OldVAEDecoderWrapper
 from demo_utils.new_vae_wrapper import NewVAEDecoderWrapper
 from utils.visualize import process_video
@@ -99,10 +99,11 @@ class InteractiveGameInference:
         self.pipeline.vae_decoder.to(torch.float16)
 
         # Initialize VAE encoder
-        vae = get_wanx_vae_wrapper(self.args.pretrained_model_path, torch.float16)
-        vae.requires_grad_(False)
-        vae.eval()
-        self.vae = vae.to(self.device, self.weight_dtype)
+        self.vae_encoder = create_wan_encoder(
+            self.args.pretrained_model_path,
+            self.device,
+            self.weight_dtype
+        )
 
     def _load_vae_decoder(self):
         """Load and optionally compile VAE decoder."""
@@ -192,7 +193,7 @@ class InteractiveGameInference:
                 padding_video = torch.zeros_like(image).repeat(1, 1, 4 * (self.args.num_output_frames - 1), 1, 1)
                 img_cond = torch.concat([image, padding_video], dim=2)
                 tiler_kwargs={"tiled": True, "tile_size": [44, 80], "tile_stride": [23, 38]}
-                img_cond = self.vae.encode(img_cond, device=self.device, **tiler_kwargs).to(self.device)
+                img_cond = self.vae_encoder.encode(img_cond, device=self.device, **tiler_kwargs).to(self.device)
 
             with torch.profiler.record_function("1.3_Condition_Preparation"):
                 mask_cond = torch.ones_like(img_cond)
@@ -200,7 +201,7 @@ class InteractiveGameInference:
                 cond_concat = torch.cat([mask_cond[:, :4], img_cond], dim=1)
 
             with torch.profiler.record_function("1.4_CLIP_Visual_Context"):
-                visual_context = self.vae.clip.encode_video(image)
+                visual_context = self.vae_encoder.clip.encode_video(image)
 
             with torch.profiler.record_function("1.5_Noise_Sampling"):
                 sampled_noise = torch.randn(

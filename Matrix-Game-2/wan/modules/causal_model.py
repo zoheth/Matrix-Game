@@ -801,36 +801,21 @@ class CausalWanModel(ModelMixin, ConfigMixin, FromOriginalModelMixin, PeftAdapte
                     )
 
         # head
-        with torch.profiler.record_function("CausalWanModel/head"):
-            x = self.head(x, e.unflatten(dim=0, sizes=t.shape).unsqueeze(2))
-        # unpatchify
-        with torch.profiler.record_function("CausalWanModel/unpatchify"):
-            x = self.unpatchify(x, grid_sizes)
+        x = self.head(x, e.reshape(*t.shape, 1, -1))
+        x = self.unpatchify(x, grid_sizes)
         return x
-
+    
     def unpatchify(self, x, grid_sizes):
-        r"""
-        Reconstruct video tensors from patch embeddings.
-
-        Args:
-            x (List[Tensor]):
-                List of patchified features, each with shape [L, C_out * prod(patch_size)]
-            grid_sizes (Tensor):
-                Original spatial-temporal grid dimensions before patching,
-                    shape [3] (3 dimensions correspond to F_patches, H_patches, W_patches)
-
-        Returns:
-            List[Tensor]:
-                Reconstructed video tensors with shape [C_out, F, H / 8, W / 8]
-        """
-
-        c = self.out_dim
-        bs = x.shape[0]
-        x = x.view(bs, *grid_sizes, *self.patch_size, c)
-        x = torch.einsum("bfhwpqrc->bcfphqwr", x)
-        x = x.reshape(bs, c, *[i * j for i, j in zip(grid_sizes, self.patch_size)])
-        return x
-        
+        f, h, w = grid_sizes
+        pt, ph, pw = self.patch_size
+       
+        return rearrange(
+            x, 
+            'b f (h w) (pt ph pw c) -> b c (f pt) (h ph) (w pw)',
+            f=f, h=h, w=w, 
+            pt=pt, ph=ph, pw=pw, 
+            c=self.out_dim
+        )
 
     def init_weights(self):
         r"""
