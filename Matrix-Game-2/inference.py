@@ -2,6 +2,7 @@ import os
 import argparse
 import torch
 import numpy as np
+from torch.profiler import profile, record_function, ProfilerActivity
 
 from omegaconf import OmegaConf
 from torchvision.transforms import v2
@@ -61,7 +62,7 @@ class InteractiveGameInference:
         current_vae_decoder.to(self.device, torch.float16)
         current_vae_decoder.requires_grad_(False)
         current_vae_decoder.eval()
-        current_vae_decoder.compile(mode="max-autotune-no-cudagraphs")
+        # current_vae_decoder.compile(mode="max-autotune-no-cudagraphs")
         pipeline = CausalInferencePipeline(self.config, generator=generator, vae_decoder=current_vae_decoder)
         if self.args.checkpoint_path:
             print("Loading Pretrained Model...")
@@ -129,15 +130,27 @@ class InteractiveGameInference:
             cond_data = Bench_actions_templerun(num_frames)
         keyboard_condition = cond_data['keyboard_condition'].unsqueeze(0).to(device=self.device, dtype=self.weight_dtype)
         conditional_dict['keyboard_cond'] = keyboard_condition
-        
+
+        # Set up profiler
+        profiler_output_path = os.path.join(self.args.output_folder, 'profiler_trace.json')
+
         with torch.no_grad():
-            videos = self.pipeline.inference(
-                noise=sampled_noise,
-                conditional_dict=conditional_dict,
-                return_latents=False,
-                mode=mode,
-                profile=False
-            )
+            with profile(
+                activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+                record_shapes=True,
+                profile_memory=True,
+                with_stack=True,
+                on_trace_ready=lambda p: p.export_chrome_trace(profiler_output_path)
+            ) as prof:
+                videos = self.pipeline.inference(
+                    noise=sampled_noise,
+                    conditional_dict=conditional_dict,
+                    return_latents=False,
+                    mode=mode,
+                    profile=False
+                )
+
+        print(f"Profiler trace saved to {profiler_output_path}")
 
         videos_tensor = torch.cat(videos, dim=1)
         videos = rearrange(videos_tensor, "B T C H W -> B T H W C")

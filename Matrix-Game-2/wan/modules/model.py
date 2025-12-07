@@ -10,6 +10,7 @@ from diffusers.models.modeling_utils import ModelMixin
 from einops import repeat, rearrange
 from .action_module import ActionModule
 from .attention import flash_attention
+from torch.profiler import record_function
 DISABLE_COMPILE = False  # get os env
 __all__ = ['WanModel']
 
