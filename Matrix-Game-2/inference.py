@@ -39,6 +39,7 @@ def parse_args():
                         help="Use CUDA Graph for inference (captures and replays GPU operations)")
     parser.add_argument("--page_size", type=int, default=16,
                         help="Page size for PagedCache (default: 16)")
+    parser.add_argument("--camera_control_path", type=str, default=None, help="Path to camera control file from Grotto (optional)")
     args = parser.parse_args()
     return args
 
@@ -215,18 +216,28 @@ class InteractiveGameInference:
                 "visual_context": visual_context.to(device=self.device, dtype=self.weight_dtype)
             }
 
-            if mode == 'universal':
-                cond_data = Bench_actions_universal(num_frames)
+            # Load camera control from file if provided, otherwise generate
+            if self.args.camera_control_path is not None:
+                cond_data = load_camera_control_from_grotto(self.args.camera_control_path, device="cuda")
+                keyboard_condition = cond_data['keyboard_condition'].unsqueeze(0).to(device=self.device, dtype=self.weight_dtype)
                 mouse_condition = cond_data['mouse_condition'].unsqueeze(0).to(device=self.device, dtype=self.weight_dtype)
-                conditional_dict['mouse_cond'] = mouse_condition
-            elif mode == 'gta_drive':
-                cond_data = Bench_actions_gta_drive(num_frames)
-                mouse_condition = cond_data['mouse_condition'].unsqueeze(0).to(device=self.device, dtype=self.weight_dtype)
-                conditional_dict['mouse_cond'] = mouse_condition
+                conditional_dict['keyboard_cond'] = keyboard_condition
+                if mode != 'templerun':
+                    conditional_dict['mouse_cond'] = mouse_condition
             else:
-                cond_data = Bench_actions_templerun(num_frames)
-            keyboard_condition = cond_data['keyboard_condition'].unsqueeze(0).to(device=self.device, dtype=self.weight_dtype)
-            conditional_dict['keyboard_cond'] = keyboard_condition
+                # Generate camera control using existing logic
+                if mode == 'universal':
+                    cond_data = Bench_actions_universal(num_frames)
+                    mouse_condition = cond_data['mouse_condition'].unsqueeze(0).to(device=self.device, dtype=self.weight_dtype)
+                    conditional_dict['mouse_cond'] = mouse_condition
+                elif mode == 'gta_drive':
+                    cond_data = Bench_actions_gta_drive(num_frames)
+                    mouse_condition = cond_data['mouse_condition'].unsqueeze(0).to(device=self.device, dtype=self.weight_dtype)
+                    conditional_dict['mouse_cond'] = mouse_condition
+                else:
+                    cond_data = Bench_actions_templerun(num_frames)
+                keyboard_condition = cond_data['keyboard_condition'].unsqueeze(0).to(device=self.device, dtype=self.weight_dtype)
+                conditional_dict['keyboard_cond'] = keyboard_condition
 
         with torch.no_grad():
             with torch.profiler.record_function("2_Pipeline_Inference"):

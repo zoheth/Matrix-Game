@@ -178,6 +178,7 @@ class AttentionKernel(nn.Module):
         use_rope: bool = False,
         rope_offset: Optional[int] = None,
         kv_mask: Optional[torch.Tensor] = None,
+        cao: bool = False,
     ) -> torch.Tensor:
         """
         Compute attention using FlashInfer with optional integrated RoPE and KV masking.
@@ -191,12 +192,17 @@ class AttentionKernel(nn.Module):
             rope_offset: Position offset for RoPE (only used when use_rope=True)
             kv_mask: Optional [seq_len_k] boolean mask for KV pairs (True = valid, False = padding)
                      Used for handling variable-length sequences with fixed-shape tensors
+            cao: Debug flag to print k tensor info
 
         Returns:
             Attention output [BS, seq_len_q, num_heads, head_dim]
         """
         BS, seq_len_q, num_heads, head_dim = q.shape
         _, seq_len_kv, _, _ = k.shape
+
+        if cao:
+            print(k[0, ::, 0, 0])  # 每组的第一个数，共N个
+            print(k.shape)
 
         # Handle KV masking for variable-length sequences
         # During cache warmup (prefill), kv_mask may have False values (padding)

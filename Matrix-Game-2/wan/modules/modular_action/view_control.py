@@ -114,9 +114,18 @@ class ViewControlInjector(ActionInjector):
         4. Output: Project back to model hidden size with residual connection
     """
 
+    # Class variable to track instance count (layer index)
+    _instance_count = 0
+    # Which layer to print debug info (set to desired layer index, e.g., 0 for first layer)
+    _debug_layer_idx = 0
+
     def __init__(self, action_config: ActionConfig):
         super().__init__()
         self.action_config = action_config
+
+        # Assign layer index to this instance
+        self.layer_idx = ViewControlInjector._instance_count
+        ViewControlInjector._instance_count += 1
 
         # Preprocessor
         self.preprocessor = ViewControlPreprocessor(
@@ -226,6 +235,10 @@ class ViewControlInjector(ActionInjector):
         # Attention computation with integrated RoPE
         # Using FlashInfer's built-in RoPE is more efficient - it computes cos/sin on-the-fly
         # and avoids separate kernel launches and memory transfers
+
+        # Only pass cao=True for the specified debug layer
+        should_debug = (self.layer_idx == ViewControlInjector._debug_layer_idx)
+
         if is_causal and kv_cache is not None:
             # For causal mode with KV cache, we need to:
             # 1. Apply RoPE to new Q/K using FlashInfer's integrated kernel
@@ -244,14 +257,15 @@ class ViewControlInjector(ActionInjector):
                 max_attention_size=self.max_attention_size,
             )
             # Compute attention with cached KV (RoPE already applied, pass mask for padding handling)
-            attn_output = self.attn_core(q_rope, k_window, v_window, causal=False, use_rope=False, kv_mask=kv_mask)
+            attn_output = self.attn_core(q_rope, k_window, v_window, causal=False, use_rope=False, kv_mask=kv_mask, cao=should_debug)
         else:
             # Regular attention: use FlashInfer's integrated RoPE for best performance
             attn_output = self.attn_core(
                 q, k, v,
                 causal=is_causal,
                 use_rope=True,
-                rope_offset=start_frame
+                rope_offset=start_frame,
+                cao=should_debug
             )
 
         # Reshape and project: [BS, T, H, D] -> [B, T*S, C_img]
