@@ -27,6 +27,8 @@ def parse_args():
                         help="Number of output latent frames")
     parser.add_argument("--seed", type=int, default=0, help="Random seed")
     parser.add_argument("--pretrained_model_path", type=str, default="Matrix-Game-2.0", help="Path to the VAE model folder")
+    parser.add_argument("--profile", action="store_true", help="Enable profiler")
+    parser.add_argument("--camera_control_path", type=str, default=None, help="Path to camera control file from Grotto (optional)")
     args = parser.parse_args()
     return args
 
@@ -117,31 +119,50 @@ class InteractiveGameInference:
             "cond_concat": cond_concat.to(device=self.device, dtype=self.weight_dtype),
             "visual_context": visual_context.to(device=self.device, dtype=self.weight_dtype)
         }
-        
-        if mode == 'universal':
-            cond_data = Bench_actions_universal(num_frames)
-            mouse_condition = cond_data['mouse_condition'].unsqueeze(0).to(device=self.device, dtype=self.weight_dtype)
-            conditional_dict['mouse_cond'] = mouse_condition
-        elif mode == 'gta_drive':
-            cond_data = Bench_actions_gta_drive(num_frames)
-            mouse_condition = cond_data['mouse_condition'].unsqueeze(0).to(device=self.device, dtype=self.weight_dtype)
-            conditional_dict['mouse_cond'] = mouse_condition
-        else:
-            cond_data = Bench_actions_templerun(num_frames)
-        keyboard_condition = cond_data['keyboard_condition'].unsqueeze(0).to(device=self.device, dtype=self.weight_dtype)
-        conditional_dict['keyboard_cond'] = keyboard_condition
 
-        # Set up profiler
-        profiler_output_path = os.path.join(self.args.output_folder, 'profiler_trace.json')
+        # Load camera control from file if provided, otherwise generate
+        if self.args.camera_control_path is not None:
+            from utils.conditions import load_camera_control_from_grotto
+            cond_data = load_camera_control_from_grotto(self.args.camera_control_path, device=self.device)
+            keyboard_condition = cond_data['keyboard_condition'].unsqueeze(0).to(device=self.device, dtype=self.weight_dtype)
+            mouse_condition = cond_data['mouse_condition'].unsqueeze(0).to(device=self.device, dtype=self.weight_dtype)
+            conditional_dict['keyboard_cond'] = keyboard_condition
+            if mode != 'templerun':
+                conditional_dict['mouse_cond'] = mouse_condition
+        else:
+            # Generate camera control using existing logic
+            if mode == 'universal':
+                cond_data = Bench_actions_universal(num_frames)
+                mouse_condition = cond_data['mouse_condition'].unsqueeze(0).to(device=self.device, dtype=self.weight_dtype)
+                conditional_dict['mouse_cond'] = mouse_condition
+            elif mode == 'gta_drive':
+                cond_data = Bench_actions_gta_drive(num_frames)
+                mouse_condition = cond_data['mouse_condition'].unsqueeze(0).to(device=self.device, dtype=self.weight_dtype)
+                conditional_dict['mouse_cond'] = mouse_condition
+            else:
+                cond_data = Bench_actions_templerun(num_frames)
+            keyboard_condition = cond_data['keyboard_condition'].unsqueeze(0).to(device=self.device, dtype=self.weight_dtype)
+            conditional_dict['keyboard_cond'] = keyboard_condition
 
         with torch.no_grad():
-            with profile(
-                activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
-                record_shapes=True,
-                profile_memory=True,
-                with_stack=True,
-                on_trace_ready=lambda p: p.export_chrome_trace(profiler_output_path)
-            ) as prof:
+            if self.args.profile:
+                profiler_output_path = os.path.join(self.args.output_folder, 'profiler_trace.json')
+                with profile(
+                    activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+                    record_shapes=True,
+                    profile_memory=True,
+                    with_stack=True,
+                    on_trace_ready=lambda p: p.export_chrome_trace(profiler_output_path)
+                ):
+                    videos = self.pipeline.inference(
+                        noise=sampled_noise,
+                        conditional_dict=conditional_dict,
+                        return_latents=False,
+                        mode=mode,
+                        profile=False
+                    )
+                print(f"Profiler trace saved to {profiler_output_path}")
+            else:
                 videos = self.pipeline.inference(
                     noise=sampled_noise,
                     conditional_dict=conditional_dict,
@@ -149,8 +170,6 @@ class InteractiveGameInference:
                     mode=mode,
                     profile=False
                 )
-
-        print(f"Profiler trace saved to {profiler_output_path}")
 
         videos_tensor = torch.cat(videos, dim=1)
         videos = rearrange(videos_tensor, "B T C H W -> B T H W C")

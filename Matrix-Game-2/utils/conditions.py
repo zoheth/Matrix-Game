@@ -1,6 +1,7 @@
 
 import torch
 import random
+from pathlib import Path
 
 def combine_data(data, num_frames=57, keyboard_dim=6, mouse=True):
     assert num_frames % 4 == 1
@@ -207,3 +208,43 @@ def Bench_actions_templerun(num_frames, num_samples_per_action=4):
             "keyboard_condition": torch.tensor(keyboard_condition)
         })
     return combine_data(data, num_frames, keyboard_dim=7, mouse=False)
+
+
+def load_camera_control_from_grotto(load_path, device="cpu"):
+    """
+    Load camera control data saved from Grotto project.
+
+    This function loads camera control data that was saved from the Grotto project
+    and is already in Matrix-Game format (keyboard_condition and mouse_condition).
+
+    Args:
+        load_path: Path to the saved .pt file
+        device: Device to load tensors to (default: "cpu")
+
+    Returns:
+        Dictionary with 'keyboard_condition' and 'mouse_condition' tensors
+
+    Example:
+        >>> cond_data = load_camera_control_from_grotto("camera_control.pt")
+        >>> keyboard_condition = cond_data['keyboard_condition'].unsqueeze(0).to(device, dtype)
+        >>> mouse_condition = cond_data['mouse_condition'].unsqueeze(0).to(device, dtype)
+    """
+    load_path = Path(load_path)
+
+    if not load_path.exists():
+        raise FileNotFoundError(f"Camera control file not found: {load_path}")
+
+    data = torch.load(load_path, map_location=device, weights_only=False)
+
+    # Verify the data has the expected keys
+    if 'keyboard_condition' not in data or 'mouse_condition' not in data:
+        raise ValueError(
+            f"Invalid camera control file. Expected keys 'keyboard_condition' and 'mouse_condition', "
+            f"but got: {list(data.keys())}"
+        )
+
+    print(f"Loaded camera control from {load_path}")
+    print(f"  - keyboard_condition shape: {data['keyboard_condition'].shape}")
+    print(f"  - mouse_condition shape: {data['mouse_condition'].shape}")
+
+    return data
