@@ -7,6 +7,74 @@ from .posemb_layers import apply_rotary_emb, get_nd_rotary_pos_embed
 import math
 from torch.nn.attention.flex_attention import flex_attention
 from torch.profiler import record_function
+import matplotlib.pyplot as plt
+import matplotlib
+import matplotlib.font_manager as fm
+import os
+import urllib.request
+
+# Configure matplotlib for Chinese font support
+def setup_chinese_font():
+    """Setup Chinese font for matplotlib"""
+    # Try to find existing Chinese fonts in system
+    chinese_fonts = []
+    for font in fm.fontManager.ttflist:
+        font_name = font.name
+        # Check for CJK fonts specifically (must contain 'CJK' or 'SC' or 'CN')
+        if any(keyword in font_name for keyword in ['CJK', 'SC', 'SimHei', 'SimSun', 'WenQuanYi', 'Source Han', 'Microsoft YaHei']):
+            chinese_fonts.append(font.name)
+            print(f"[字体检测] 发现字体: {font.name}")
+
+    if chinese_fonts:
+        print(f"[字体] 使用中文字体: {chinese_fonts[0]}")
+        matplotlib.rcParams['font.sans-serif'] = [chinese_fonts[0], 'DejaVu Sans']
+        matplotlib.rcParams['axes.unicode_minus'] = False
+        return
+
+    # Fallback: try generic Noto Sans CJK names
+    print("[字体] 尝试使用通用CJK字体名称...")
+    for font_name in ['Noto Sans CJK SC', 'Noto Sans CJK TC', 'Noto Serif CJK SC']:
+        matplotlib.rcParams['font.sans-serif'] = [font_name, 'DejaVu Sans']
+        matplotlib.rcParams['axes.unicode_minus'] = False
+        print(f"[字体] 设置为: {font_name}")
+        return
+
+    # If no Chinese font found, try to download one
+    print("[字体] 未找到中文字体，尝试下载 Noto Sans SC...")
+    font_dir = os.path.expanduser("~/.fonts")
+    os.makedirs(font_dir, exist_ok=True)
+    font_path = os.path.join(font_dir, "NotoSansSC-Regular.otf")
+
+    if not os.path.exists(font_path):
+        try:
+            url = "https://github.com/googlefonts/noto-cjk/raw/main/Sans/OTF/SimplifiedChinese/NotoSansSC-Regular.otf"
+            print(f"[字体] 正在从 {url} 下载字体...")
+            urllib.request.urlretrieve(url, font_path)
+            print(f"[字体] 字体已下载到 {font_path}")
+
+            # Add the font to matplotlib
+            fm.fontManager.addfont(font_path)
+            matplotlib.rcParams['font.sans-serif'] = ['Noto Sans SC', 'DejaVu Sans']
+            print("[字体] 字体配置完成")
+        except Exception as e:
+            print(f"[字体] 下载字体失败: {e}")
+            print("[字体] 请手动安装中文字体，如: sudo apt-get install fonts-noto-cjk")
+            # Fallback: use system default (will show boxes for Chinese)
+            matplotlib.rcParams['font.sans-serif'] = ['DejaVu Sans']
+    else:
+        # Font file exists, just add it
+        try:
+            fm.fontManager.addfont(font_path)
+            matplotlib.rcParams['font.sans-serif'] = ['Noto Sans SC', 'DejaVu Sans']
+            print(f"[字体] 使用已下载的字体: {font_path}")
+        except Exception as e:
+            print(f"[字体] 加载字体失败: {e}")
+            matplotlib.rcParams['font.sans-serif'] = ['DejaVu Sans']
+
+    matplotlib.rcParams['axes.unicode_minus'] = False  # Fix minus sign display
+
+# Setup font when module loads
+setup_chinese_font()
 
 try:
     import flash_attn_interface
@@ -42,6 +110,11 @@ class ActionModule(nn.Module):
     鼠标控制信号的输入是一个 L*D 的向量
     键盘同样
     """
+
+    # Class variables for collecting attention across all layers
+    _attn_weights_buffer = []
+    _attn_collection_enabled = False
+    _attn_save_counter = 0
 
     def __init__(
         self, 
@@ -317,6 +390,130 @@ class ActionModule(nn.Module):
                                 kv_cache_mouse["k"][:, max(0, local_end_index - max_attention_size):local_end_index],
                                 kv_cache_mouse["v"][:, max(0, local_end_index - max_attention_size):local_end_index],
                             )
+                            print(q.shape)
+                            print(kv_cache_mouse["k"][:, max(0, local_end_index - max_attention_size):local_end_index].shape)
+
+                            # Collect attention heatmap on 3rd iteration (start_frame == 3)
+                            if start_frame == 42:
+                                # Get q and k tensors
+                                q_tensor = q  # [880, 3, 16, 64]
+                                k_tensor = kv_cache_mouse["k"][:, max(0, local_end_index - max_attention_size):local_end_index]  # [880, 6, 16, 64]
+
+                                # Compute naive attention scores: Q @ K^T / sqrt(d)
+                                q_attn = q_tensor.transpose(1, 2)  # [880, 16, 3, 64]
+                                k_attn = k_tensor.transpose(1, 2)  # [880, 16, 6, 64]
+
+                                # Compute attention scores
+                                scale = 1.0 / math.sqrt(q_tensor.shape[-1])  # 1/sqrt(64)
+                                attn_scores = torch.matmul(q_attn, k_attn.transpose(-2, -1)) * scale  # [880, 16, 3, 6]
+
+                                # Apply softmax to get attention weights
+                                attn_weights = torch.softmax(attn_scores, dim=-1)  # [880, 16, 3, 6]
+
+                                # Add to buffer for averaging across layers
+                                ActionModule._attn_weights_buffer.append(attn_weights.detach())
+                                ActionModule._attn_collection_enabled = True
+                                ActionModule._attn_save_counter += 1
+
+                                # Check if we should save (after collecting enough layers, e.g., 20+)
+                                if len(ActionModule._attn_weights_buffer) >= 20:
+                                    print(f"[Attention Heatmap] Collected {len(ActionModule._attn_weights_buffer)} layers, saving averaged heatmap...")
+
+                                    # Average all collected attention weights across layers
+                                    attn_avg_layers = torch.stack(ActionModule._attn_weights_buffer).mean(dim=0)  # [880, 16, 3, 6]
+
+                                    # Create output directory
+                                    output_dir = "attention_heatmaps"
+                                    os.makedirs(output_dir, exist_ok=True)
+
+                                    # 批次池化：将880个batch重塑为22组，每组40个batch
+                                    batch_size = attn_avg_layers.shape[0]  # 880
+                                    pool_size = 40  # 每40个batch做一次池化
+                                    num_groups = batch_size // pool_size  # 22
+
+                                    # 重塑并池化：[880, 16, 3, 6] -> [22, 40, 16, 3, 6] -> [22, 3, 6]
+                                    attn_pooled = attn_avg_layers[:num_groups * pool_size].reshape(num_groups, pool_size, 16, 3, 6)
+                                    attn_pooled = attn_pooled.mean(dim=(1, 2))  # [22, 3, 6] - 对pool_size和heads维度求平均
+
+                                    # 重塑为 [22*3, 6] = [66, 6] 用于可视化
+                                    attn_heatmap = attn_pooled.reshape(-1, 6)  # [66, 6]
+
+                                    # 转移到CPU并转换为numpy
+                                    attn_heatmap_np = attn_heatmap.cpu().float().numpy()
+
+                                    # 创建详细热力图
+                                    fig, ax = plt.subplots(figsize=(8, 12))
+                                    im = ax.imshow(attn_heatmap_np, aspect='auto', cmap='hot', interpolation='nearest')
+
+                                    # 添加颜色条
+                                    plt.colorbar(im, ax=ax, label='注意力权重')
+
+                                    # 设置标签和标题
+                                    ax.set_xlabel('K位置', fontsize=12)
+                                    ax.set_ylabel('Q位置（池化后的批次组）', fontsize=12)
+                                    ax.set_title(f'注意力热力图 - 帧{start_frame}（{len(ActionModule._attn_weights_buffer)}层平均）\n' +
+                                               f'[{num_groups}个批次组 × 3个Q token] × [6个K token]\n' +
+                                               'K[0-2]: 第1次迭代（较早历史），K[3-5]: 第2次迭代（较近历史）',
+                                               fontsize=11, pad=15)
+
+                                    # 添加x轴标签
+                                    ax.set_xticks([0, 1, 2, 3, 4, 5])
+                                    ax.set_xticklabels(['K0\n(第1次)', 'K1\n(第1次)', 'K2\n(第1次)',
+                                                       'K3\n(第2次)', 'K4\n(第2次)', 'K5\n(第2次)'])
+
+                                    # 添加垂直线分隔K的两个部分
+                                    ax.axvline(x=2.5, color='cyan', linestyle='--', linewidth=2, alpha=0.7,
+                                              label='分界线：第1次 vs 第2次迭代')
+                                    ax.legend(loc='upper right', fontsize=9)
+
+                                    # 每3行添加一条水平网格线（分隔批次组）
+                                    for i in range(0, num_groups * 3, 3):
+                                        if i > 0:
+                                            ax.axhline(y=i - 0.5, color='white', linestyle='-', linewidth=0.5, alpha=0.3)
+
+                                    plt.tight_layout()
+                                    plt.savefig(os.path.join(output_dir, f'attn_heatmap_detailed_layeravg_frame{start_frame}.png'), dpi=200)
+                                    plt.close()
+
+                                    # 创建汇总视图
+                                    attn_summary = attn_pooled.mean(dim=0)  # [3, 6]
+                                    attn_summary_np = attn_summary.cpu().float().numpy()
+
+                                    fig, ax = plt.subplots(figsize=(8, 5))
+                                    im = ax.imshow(attn_summary_np, aspect='auto', cmap='hot', interpolation='nearest')
+                                    plt.colorbar(im, ax=ax, label='注意力权重')
+
+                                    ax.set_xlabel('K位置', fontsize=12)
+                                    ax.set_ylabel('Q位置（当前token）', fontsize=12)
+                                    ax.set_title(f'注意力汇总 - 帧{start_frame}（{len(ActionModule._attn_weights_buffer)}层平均）\n' +
+                                               'K[0-2]: 第1次迭代（较早），K[3-5]: 第2次迭代（较近）',
+                                               fontsize=11, pad=15)
+
+                                    ax.set_xticks([0, 1, 2, 3, 4, 5])
+                                    ax.set_xticklabels(['K0\n(第1次)', 'K1\n(第1次)', 'K2\n(第1次)',
+                                                       'K3\n(第2次)', 'K4\n(第2次)', 'K5\n(第2次)'])
+                                    ax.set_yticks([0, 1, 2])
+                                    ax.set_yticklabels(['Q0\n(第3次)', 'Q1\n(第3次)', 'Q2\n(第3次)'])
+
+                                    ax.axvline(x=2.5, color='cyan', linestyle='--', linewidth=2, alpha=0.7)
+
+                                    plt.tight_layout()
+                                    plt.savefig(os.path.join(output_dir, f'attn_summary_layeravg_frame{start_frame}.png'), dpi=150)
+                                    plt.close()
+
+                                    # 计算统计信息
+                                    first_half_attn = attn_summary_np[:, :3].mean()  # K[0-2]: 第1次迭代
+                                    second_half_attn = attn_summary_np[:, 3:].mean()  # K[3-5]: 第2次迭代
+
+                                    print(f"[注意力统计] K[0-2]（第1次迭代，较早历史）: {first_half_attn:.4f}")
+                                    print(f"[注意力统计] K[3-5]（第2次迭代，较近历史）: {second_half_attn:.4f}")
+                                    print(f"[注意力统计] 比例（较近/较早）: {second_half_attn/first_half_attn:.4f}")
+                                    print(f"[注意力热力图] 已保存到 {output_dir}/")
+
+                                    # Clear buffer for next round
+                                    ActionModule._attn_weights_buffer.clear()
+                                    ActionModule._attn_save_counter = 0
+
                         kv_cache_mouse["global_end_index"].fill_(current_end)
                         kv_cache_mouse["local_end_index"].fill_(local_end_index)
                 else:
